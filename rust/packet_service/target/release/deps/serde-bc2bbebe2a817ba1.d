@@ -1,0 +1,14 @@
+/home/admin/Desktop/Code/pacsni/packet_analyzer/rust/packet_service/target/release/deps/serde-bc2bbebe2a817ba1.d: /home/admin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/admin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/admin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/admin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/admin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /home/admin/Desktop/Code/pacsni/packet_analyzer/rust/packet_service/target/release/build/serde-eb935182b8a7f305/out/private.rs
+
+/home/admin/Desktop/Code/pacsni/packet_analyzer/rust/packet_service/target/release/deps/libserde-bc2bbebe2a817ba1.rlib: /home/admin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/admin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/admin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/admin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/admin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /home/admin/Desktop/Code/pacsni/packet_analyzer/rust/packet_service/target/release/build/serde-eb935182b8a7f305/out/private.rs
+
+/home/admin/Desktop/Code/pacsni/packet_analyzer/rust/packet_service/target/release/deps/libserde-bc2bbebe2a817ba1.rmeta: /home/admin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/admin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/admin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/admin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/admin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /home/admin/Desktop/Code/pacsni/packet_analyzer/rust/packet_service/target/release/build/serde-eb935182b8a7f305/out/private.rs
+
+/home/admin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs:
+/home/admin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs:
+/home/admin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs:
+/home/admin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs:
+/home/admin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs:
+/home/admin/Desktop/Code/pacsni/packet_analyzer/rust/packet_service/target/release/build/serde-eb935182b8a7f305/out/private.rs:
+
+# env-dep:OUT_DIR=/home/admin/Desktop/Code/pacsni/packet_analyzer/rust/packet_service/target/release/build/serde-eb935182b8a7f305/out
