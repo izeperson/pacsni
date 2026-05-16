@@ -1,12 +1,12 @@
-.PHONY: all cpp rust go run clean
+.PHONY: all cpp rust go run clean certs
 
-all: cpp rust go
+all: cpp rust go certs
 
 # Build the C++ packet capture program
 cpp:
 	@echo "Building C++ packet capture..."
 	@mkdir -p cpp/bin
-	@g++ -std=c++11 -Wall -Wextra -lpcap cpp/packet_capture.cpp -o cpp/bin/packet_capture
+	@g++ -std=c++11 -Wall -Wextra -lpcap -lssl -lcrypto cpp/packet_capture.cpp -o cpp/bin/packet_capture
 
 # Build the Rust packet service
 rust:
@@ -19,10 +19,17 @@ rust:
 go:
 	@echo "Building Go dashboard..."
 	@mkdir -p go/bin
-	@cd go/dashboard && ( [ -f go.mod ] || go mod init dashboard ) && go build -o ../bin/dashboard .
+	@cd go/dashboard && ( [ -f go.mod ] || go mod init dashboard ) && go mod tidy && go build -o ../bin/dashboard .
+
+# Generate self-signed certificates for TLS
+certs:
+	@if [ ! -f server.crt ] || [ ! -f server.key ]; then \
+		echo "Generating self-signed certificates..."; \
+		openssl req -x509 -newkey rsa:4096 -keyout server.key -out server.crt -days 365 -nodes -subj "/CN=localhost"; \
+	fi
 
 # Run all components
-run: all
+run: all certs
 	@echo "Starting Real-Time Packet Analyzer System..."
 	@echo "Make sure you have libpcap installed and run with sudo if needed for packet capture"
 	@echo ""
@@ -37,7 +44,7 @@ run: all
 # Clean build artifacts
 clean:
 	@echo "Cleaning up..."
-	@rm -rf cpp/bin rust/bin go/bin
+	@rm -rf cpp/bin rust/bin go/bin server.crt server.key
 	@cd rust/packet_service && cargo clean
 	@echo "Clean complete."
 
