@@ -154,18 +154,15 @@ func getCountry(ip string) string {
 	geoCache[ip] = "searching..."
 	geoMu.Unlock()
 
-	// Queue the IP for the worker pool instead of spawning a goroutine
 	select {
 	case geoReqChan <- ip:
 	default:
-		// Queue full, ignore request
 	}
 
 	return "searching..."
 }
 
 func geoWorker() {
-	// Rate limit: ~40 requests per minute to stay safely under the 45 req/min limit
 	ticker := time.NewTicker(1500 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -188,14 +185,12 @@ func geoWorker() {
 
 			saveGeoCacheToDisk()
 
-			// Notify frontend that a specific IP now has country data
 			broadcast(map[string]interface{}{
 				"type":    "geo_update",
 				"ip":      ip,
 				"country": strings.ToLower(res.Country),
 			})
 		} else {
-			// Prevent IPs from being stuck in "searching..." on failure
 			geoMu.Lock()
 			delete(geoCache, ip)
 			geoMu.Unlock()
@@ -250,23 +245,39 @@ func main() {
 
 	loadGeoCache()
 
-	// Start the Geo-IP worker pool
 	go geoWorker()
 
-	// Background goroutine to handle reconnection to the Rust service
 	go func() {
+		const (
+			minInterval = 2 * time.Second
+			maxInterval = 60 * time.Second
+		)
+		consecutiveFailures := 0
+
 		for {
+			if consecutiveFailures > 0 {
+				backoff := minInterval * (1 << uint(consecutiveFailures-1))
+				if backoff > maxInterval || backoff < minInterval {
+					backoff = maxInterval
+				}
+				fmt.Fprintf(os.Stderr, "[RECONNECT] Consecutive failures: %d. Waiting %v before next attempt...\r\n", consecutiveFailures, backoff)
+				time.Sleep(backoff)
+			}
+
 			dialer := net.Dialer{Timeout: 5 * time.Second}
 			conn, err := dialer.Dial("tcp", "127.0.0.1:9003")
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "[GO] Rust service unreachable, retrying in 2s...\r\n")
-				time.Sleep(2 * time.Second)
+				consecutiveFailures++
 				continue
 			}
 
+			if consecutiveFailures > 0 {
+				fmt.Printf("[RECONNECT] Connection restored.\r\n")
+			}
+			consecutiveFailures = 0
+
 			fmt.Printf("Connected to Rust packet service.\r\n")
 			scanner := bufio.NewScanner(conn)
-			// Increase buffer for high-volume JSON lines
 			buf := make([]byte, 0, 64*1024)
 			scanner.Buffer(buf, 1024*1024)
 
@@ -281,11 +292,10 @@ func main() {
 			if err := scanner.Err(); err != nil {
 				fmt.Fprintf(os.Stderr, "Connection lost: %v. Retrying...\r\n", err)
 			}
-			time.Sleep(2 * time.Second)
+			consecutiveFailures++
 		}
 	}()
 
-	// Dedicated worker to manage state - much faster than prepending to slice
 	go func() {
 		for pkt := range packetChan {
 			mu.Lock()
@@ -296,6 +306,9 @@ func main() {
 			packetCounter++
 			pkt.Index = packetCounter
 			pkt.Info = getPacketInfo(&pkt)
+			if len(seenIPs) > 10000 {
+				seenIPs = make(map[string]bool)
+			}
 			seenIPs[pkt.SrcIP] = true
 			seenIPs[pkt.DstIP] = true
 
@@ -362,28 +375,24 @@ func main() {
 		w.Header().Set("Content-Disposition", "attachment; filename=\"pacsni_capture.pcap\"")
 		w.Header().Set("Content-Type", "application/vnd.tcpdump.pcap")
 
-		// PCAP Global Header
-		binary.Write(w, binary.LittleEndian, uint32(0xa1b2c3d4)) // magic
-		binary.Write(w, binary.LittleEndian, uint16(2))          // major
-		binary.Write(w, binary.LittleEndian, uint16(4))          // minor
-		binary.Write(w, binary.LittleEndian, int32(0))           // gmt to local
-		binary.Write(w, binary.LittleEndian, uint32(0))          // accuracy
-		binary.Write(w, binary.LittleEndian, uint32(65535))      // snaplen
-		binary.Write(w, binary.LittleEndian, uint32(1))          // network (Ethernet)
+		binary.Write(w, binary.LittleEndian, uint32(0xa1b2c3d4))
+		binary.Write(w, binary.LittleEndian, uint16(2))
+		binary.Write(w, binary.LittleEndian, uint16(4))
+		binary.Write(w, binary.LittleEndian, int32(0))
+		binary.Write(w, binary.LittleEndian, uint32(0))
+		binary.Write(w, binary.LittleEndian, uint32(65535))
+		binary.Write(w, binary.LittleEndian, uint32(1))
 
 		for i := 0; i < len(history); i++ {
 			p := history[i]
-			// Minimal reconstruction: Ethernet(14) + IP(20) + Data
-			// For brevity, we export the raw payload bytes if available
 			payload := p.Payload
 			sec := uint32(p.Timestamp / 1000000)
 			usec := uint32(p.Timestamp % 1000000)
 
-			// Packet Header
 			binary.Write(w, binary.LittleEndian, sec)
 			binary.Write(w, binary.LittleEndian, usec)
-			binary.Write(w, binary.LittleEndian, uint32(len(payload))) // captured
-			binary.Write(w, binary.LittleEndian, uint32(len(payload))) // original
+			binary.Write(w, binary.LittleEndian, uint32(len(payload)))
+			binary.Write(w, binary.LittleEndian, uint32(len(payload)))
 			w.Write(payload)
 		}
 	})
@@ -412,7 +421,6 @@ func main() {
 			mu.Lock()
 			if filterStr != f[0] {
 				filterStr = f[0]
-				// Removed historyBuffer.Clear() to prevent data loss on filter change
 				broadcast(map[string]interface{}{"type": "status", "isScanning": isScanning, "filter": filterStr})
 			}
 			mu.Unlock()

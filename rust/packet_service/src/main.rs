@@ -1,14 +1,15 @@
 use std::net::{SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::net::{TcpListener, TcpStream as TokioTcpStream};
+use tokio::net::{TcpStream as TokioTcpStream, TcpSocket};
 use tokio::sync::broadcast::{self, Sender};
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use bytes::{BytesMut, Buf};
 use tokio_rustls::rustls::{self, pki_types::{CertificateDer, PrivateKeyDer}};
 use tokio_rustls::TlsAcceptor;
+use ring::hmac;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use sha2::{Sha512, Digest};
+use sha2::{Sha512};
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::fs::File;
@@ -16,7 +17,7 @@ use std::io::BufReader;
 
 const SHARED_SECRET: &[u8] = b"pacsni_secure_shared_secret_123";
 const STRUCT_SIZE: usize = 163;
-const HASH_SIZE: usize = 64; // SHA-512
+const HASH_SIZE: usize = 64;
 const TOTAL_MSG_SIZE: usize = STRUCT_SIZE + HASH_SIZE;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -64,12 +65,10 @@ fn load_key(path: &str) -> PrivateKeyDer<'static> {
     let file = File::open(path).expect("cannot open key file");
     let mut reader = BufReader::new(file);
 
-    // Attempt to load PKCS8 keys first
     if let Some(Ok(key)) = rustls_pemfile::pkcs8_private_keys(&mut reader).next() {
         return key.into();
     }
 
-    // Fallback to RSA keys (standard for many self-signed certs)
     let mut reader = BufReader::new(File::open(path).expect("cannot reopen key file"));
     if let Some(Ok(key)) = rustls_pemfile::rsa_private_keys(&mut reader).next() {
         return key.into();
@@ -107,10 +106,20 @@ async fn main() {
     let cpp_addr = SocketAddr::from_str("127.0.0.1:9001").expect("Invalid CPP address");
     let go_addr = SocketAddr::from_str("127.0.0.1:9003").expect("Invalid GO address");
 
-    let cpp_listener = TcpListener::bind(&cpp_addr).await.expect("Failed to bind CPP listener");
+    let cpp_socket = TcpSocket::new_v4().expect("Failed to create CPP socket");
+    cpp_socket.set_reuseaddr(true).expect("Failed to set reuseaddr on CPP socket");
+    #[cfg(unix)]
+    cpp_socket.set_reuseport(true).expect("Failed to set reuseport on CPP socket");
+    cpp_socket.bind(cpp_addr).expect("Failed to bind CPP socket");
+    let cpp_listener = cpp_socket.listen(1024).expect("Failed to listen on CPP socket");
     print!("Listening for C++ on {}\r\n", cpp_addr);
 
-    let go_listener = TcpListener::bind(&go_addr).await.expect("Failed to bind GO listener");
+    let go_socket = TcpSocket::new_v4().expect("Failed to create GO socket");
+    go_socket.set_reuseaddr(true).expect("Failed to set reuseaddr on GO socket");
+    #[cfg(unix)]
+    go_socket.set_reuseport(true).expect("Failed to set reuseport on GO socket");
+    go_socket.bind(go_addr).expect("Failed to bind GO socket");
+    let go_listener = go_socket.listen(1024).expect("Failed to listen on GO socket");
     print!("Listening for GO on {}\r\n", go_addr);
 
     let cpp_tx = tx_arc.clone();
@@ -164,7 +173,6 @@ async fn main() {
 }
 
 async fn handle_cpp_connection<S: io::AsyncRead + io::AsyncWrite + Unpin>(mut socket: S, tx: Arc<Sender<DashboardPacket>>) -> io::Result<()> {
-    // Pre-allocate a reasonable buffer to reduce reallocations
     let mut buffer = BytesMut::with_capacity(TOTAL_MSG_SIZE * 10);
     loop {
         if buffer.capacity() - buffer.len() < TOTAL_MSG_SIZE {
@@ -183,22 +191,15 @@ async fn handle_cpp_connection<S: io::AsyncRead + io::AsyncWrite + Unpin>(mut so
         }
 
         while buffer.len() >= TOTAL_MSG_SIZE {
-            // Peek at the data for hash verification before consuming
             let chunk = &buffer[..STRUCT_SIZE];
             let received_hash = &buffer[STRUCT_SIZE..TOTAL_MSG_SIZE];
 
-            // Verify SHA-512 Signature
-            let mut hasher = Sha512::new();
-            hasher.update(chunk);
-            hasher.update(SHARED_SECRET);
-            let expected_hash = hasher.finalize();
-            
-            if received_hash != expected_hash.as_slice() {
+            let key = hmac::Key::new(hmac::HMAC_SHA512, SHARED_SECRET);
+            if hmac::verify(&key, chunk, received_hash).is_err() {
                 eprint!("[RUST] CRITICAL: Authentication failed from peer {}. Dropping connection.\r\n", "C++");
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "SHA-512 Authentication Failed"));
             }
 
-            // Now safely consume the buffer using Buf trait
             let timestamp = buffer.get_u64_le();
             let src_ip_raw = buffer.get_u32();
             let dst_ip_raw = buffer.get_u32();
@@ -215,7 +216,6 @@ async fn handle_cpp_connection<S: io::AsyncRead + io::AsyncWrite + Unpin>(mut so
             let mut payload_raw = [0u8; 128];
             buffer.copy_to_slice(&mut payload_raw);
             
-            // Advance past the hash (we already peeked at it)
             buffer.advance(HASH_SIZE);
 
             let valid_len = (payload_len as usize).min(128);
