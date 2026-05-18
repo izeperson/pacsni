@@ -16,12 +16,13 @@
 #include <iostream>
 #include <chrono>
 #include <memory>
+#include <optional> // For std::optional
+#include <tuple>    // For std::tuple, though custom structs are used
 #include <vector>
 #include <atomic>
 #include <signal.h>
 
 const char* DEST_IP = "127.0.0.1";
-const int DEST_PORT = 9001;
 const char* SHARED_SECRET = "pacsni_secure_shared_secret_123";
 const int MAX_PAYLOAD_SIZE = 128;
 
@@ -36,6 +37,30 @@ struct __attribute__((__packed__)) PacketInfo {
     uint8_t  src_mac[6];
     uint8_t  dst_mac[6];
     uint8_t  payload[MAX_PAYLOAD_SIZE];
+};
+
+// Helper struct for Ethernet layer info
+struct EthernetInfo {
+    const ether_header* header;
+    int header_len;
+    uint16_t ether_type;
+};
+
+// Helper struct for IP layer info
+struct IpInfo {
+    const ip* header;
+    int header_len;
+    uint32_t src_ip;
+    uint32_t dst_ip;
+    uint8_t protocol;
+};
+
+// Helper struct for Transport layer info
+struct TransportInfo {
+    uint16_t src_port;
+    uint16_t dst_port;
+    const u_char* payload_ptr;
+    int payload_len;
 };
 
 struct SslCtxDeleter { void operator()(SSL_CTX* ctx) { if (ctx) SSL_CTX_free(ctx); } };
@@ -114,56 +139,89 @@ void send_packet_info(SSL* ssl, const PacketInfo& info) {
     }
 }
 
+// Helper function to parse Ethernet layer
+std::optional<EthernetInfo> parse_ethernet_layer(const u_char* packet, uint32_t caplen) {
+    if (caplen < sizeof(ether_header)) {
+        return std::nullopt;
+    }
+    const ether_header* eth_header = reinterpret_cast<const ether_header*>(packet);
+    if (ntohs(eth_header->ether_type) != ETHERTYPE_IP) {
+        return std::nullopt;
+    }
+    return EthernetInfo{eth_header, sizeof(ether_header), ntohs(eth_header->ether_type)};
+}
+
+// Helper function to parse IP layer
+std::optional<IpInfo> parse_ip_layer(const u_char* packet, uint32_t caplen, int eth_header_len) {
+    if (caplen < (uint32_t)(eth_header_len + sizeof(ip))) {
+        return std::nullopt;
+    }
+    const ip* ip_header = reinterpret_cast<const ip*>(packet + eth_header_len);
+    if (ip_header->ip_v != 4) {
+        return std::nullopt;
+    }
+    int ip_header_len = ip_header->ip_hl * 4;
+    if (ip_header_len < 20 || caplen < (uint32_t)(eth_header_len + ip_header_len)) {
+        return std::nullopt;
+    }
+    return IpInfo{ip_header, ip_header_len, ip_header->ip_src.s_addr, ip_header->ip_dst.s_addr, ip_header->ip_p};
+}
+
+// Helper function to parse Transport layer (TCP/UDP)
+std::optional<TransportInfo> parse_transport_layer(const u_char* packet, uint32_t caplen, int eth_header_len, const IpInfo& ip_info) {
+    uint16_t src_port = 0;
+    uint16_t dst_port = 0;
+    const u_char* payload_ptr = nullptr;
+    int payload_len = 0;
+
+    if (ip_info.protocol == IPPROTO_TCP) {
+        if (caplen < (uint32_t)(eth_header_len + ip_info.header_len + sizeof(tcphdr))) {
+            return std::nullopt;
+        }
+        const tcphdr* tcp_header = reinterpret_cast<const tcphdr*>(packet + eth_header_len + ip_info.header_len);
+        int tcp_header_len = tcp_header->th_off * 4;
+        if (tcp_header_len < 20 || caplen < (uint32_t)(eth_header_len + ip_info.header_len + tcp_header_len)) {
+            return std::nullopt;
+        }
+        src_port = ntohs(tcp_header->source);
+        dst_port = ntohs(tcp_header->dest);
+        payload_ptr = packet + eth_header_len + ip_info.header_len + tcp_header_len;
+        payload_len = ntohs(ip_info.header->ip_len) - ip_info.header_len - tcp_header_len;
+    } else if (ip_info.protocol == IPPROTO_UDP) {
+        if (caplen < (uint32_t)(eth_header_len + ip_info.header_len + sizeof(udphdr))) {
+            return std::nullopt;
+        }
+        const udphdr* udp_header = reinterpret_cast<const udphdr*>(packet + eth_header_len + ip_info.header_len);
+        src_port = ntohs(udp_header->source);
+        dst_port = ntohs(udp_header->dest);
+        payload_ptr = packet + eth_header_len + ip_info.header_len + sizeof(udphdr);
+        payload_len = ntohs(udp_header->len) - sizeof(udphdr);
+    } else {
+        payload_ptr = packet + eth_header_len + ip_info.header_len;
+        payload_len = ntohs(ip_info.header->ip_len) - ip_info.header_len;
+    }
+    return TransportInfo{src_port, dst_port, payload_ptr, payload_len};
+}
+
 void packet_handler(u_char* user_data, const struct pcap_pkthdr* pkthdr, const u_char* packet) {
     if (!user_data || !pkthdr || !packet) return;
 
     SSL* ssl = reinterpret_cast<SSL*>(user_data);
 
-    if (pkthdr->caplen < sizeof(struct ether_header)) return;
-    struct ether_header* eth_header = (struct ether_header*)packet;
-    if (ntohs(eth_header->ether_type) != ETHERTYPE_IP) {
-        return;
-    }
+    // Parse Ethernet Layer
+    std::optional<EthernetInfo> eth_info_opt = parse_ethernet_layer(packet, pkthdr->caplen);
+    if (!eth_info_opt) return;
+    EthernetInfo eth_info = *eth_info_opt;
 
-    if (pkthdr->caplen < sizeof(struct ether_header) + sizeof(struct ip)) return;
-    struct ip* ip_header = (struct ip*)(packet + sizeof(struct ether_header));
-    if (ip_header->ip_v != 4) return;
+    // Parse IP Layer
+    std::optional<IpInfo> ip_info_opt = parse_ip_layer(packet, pkthdr->caplen, eth_info.header_len);
+    if (!ip_info_opt) return;
+    IpInfo ip_info = *ip_info_opt;
 
-    int ip_header_len = ip_header->ip_hl * 4;
-    if (ip_header_len < 20 || pkthdr->caplen < (uint32_t)(sizeof(struct ether_header) + ip_header_len)) {
-        return;
-    }
-
-    uint32_t src_ip = ip_header->ip_src.s_addr;
-    uint32_t dst_ip = ip_header->ip_dst.s_addr;
-
-    uint8_t protocol = ip_header->ip_p;
-    uint16_t src_port = 0;
-    uint16_t dst_port = 0;
-    const u_char* payload = nullptr;
-    int payload_len = 0;
-
-    if (protocol == IPPROTO_TCP) {
-        if (pkthdr->caplen < (uint32_t)(sizeof(struct ether_header) + ip_header_len + sizeof(struct tcphdr))) return;
-        struct tcphdr* tcp_header = (struct tcphdr*)(packet + sizeof(struct ether_header) + ip_header_len);
-        int tcp_header_len = tcp_header->th_off * 4;
-        if (tcp_header_len < 20 || pkthdr->caplen < (uint32_t)(sizeof(struct ether_header) + ip_header_len + tcp_header_len)) return;
-
-        src_port = ntohs(tcp_header->source);
-        dst_port = ntohs(tcp_header->dest);
-        payload = packet + sizeof(struct ether_header) + ip_header_len + tcp_header_len;
-        payload_len = ntohs(ip_header->ip_len) - ip_header_len - tcp_header_len;
-    } else if (protocol == IPPROTO_UDP) {
-        if (pkthdr->caplen < (uint32_t)(sizeof(struct ether_header) + ip_header_len + sizeof(struct udphdr))) return;
-        struct udphdr* udp_header = (struct udphdr*)(packet + sizeof(struct ether_header) + ip_header_len);
-        src_port = ntohs(udp_header->source);
-        dst_port = ntohs(udp_header->dest);
-        payload = packet + sizeof(struct ether_header) + ip_header_len + sizeof(struct udphdr);
-        payload_len = ntohs(udp_header->len) - sizeof(struct udphdr);
-    } else {
-        payload = packet + sizeof(struct ether_header) + ip_header_len;
-        payload_len = ntohs(ip_header->ip_len) - ip_header_len;
-    }
+    // Parse Transport Layer
+    std::optional<TransportInfo> transport_info_opt = parse_transport_layer(packet, pkthdr->caplen, eth_info.header_len, ip_info);
+    if (!transport_info_opt) return;
+    TransportInfo transport_info = *transport_info_opt;
 
     PacketInfo info;
     memset(&info, 0, sizeof(info));
@@ -172,28 +230,32 @@ void packet_handler(u_char* user_data, const struct pcap_pkthdr* pkthdr, const u
         pkthdr->ts.tv_sec * 1000000LL + pkthdr->ts.tv_usec
     );
     info.timestamp = duration.count();
-    info.src_ip = src_ip;
-    info.dst_ip = dst_ip;
-    info.src_port = src_port;
-    info.dst_port = dst_port;
-    info.protocol = protocol;
-    info.payload_len = (payload_len < 0) ? 0 : (uint16_t)payload_len;
+    info.src_ip = ip_info.src_ip;
+    info.dst_ip = ip_info.dst_ip;
+    info.src_port = transport_info.src_port;
+    info.dst_port = transport_info.dst_port;
+    info.protocol = ip_info.protocol;
+    info.payload_len = (transport_info.payload_len < 0) ? 0 : (uint16_t)transport_info.payload_len;
     memcpy(info.src_mac, eth_header->ether_shost, 6);
     memcpy(info.dst_mac, eth_header->ether_dhost, 6);
 
-    if (payload_len > 0 && payload != nullptr) {
-        uint32_t captured_payload_len = pkthdr->caplen - (uint32_t)(payload - packet);
-        size_t actual_copy = (payload_len < (int)captured_payload_len) ? (size_t)payload_len : (size_t)captured_payload_len;
+    if (transport_info.payload_len > 0 && transport_info.payload_ptr != nullptr) {
+        uint32_t captured_payload_len = pkthdr->caplen - (uint32_t)(transport_info.payload_ptr - packet);
+        size_t actual_copy = (transport_info.payload_len < (int)captured_payload_len) ? (size_t)transport_info.payload_len : (size_t)captured_payload_len;
         if (actual_copy > MAX_PAYLOAD_SIZE) actual_copy = MAX_PAYLOAD_SIZE;
-        memcpy(info.payload, payload, actual_copy);
+        memcpy(info.payload, transport_info.payload_ptr, actual_copy);
     }
 
     send_packet_info(ssl, info);
 }
 
-int main() {
+int main(int argc, char* argv[]) {
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
+
+    const char* dest_ip_env = getenv("RUST_SERVICE_HOST");
+    const char* dest_ip = dest_ip_env ? dest_ip_env : "127.0.0.1";
+    const int dest_port = 9001;
 
     if (SSL_library_init() != 1) {
         fprintf(stderr, "Error: SSL_library_init failed\n");
@@ -234,12 +296,29 @@ int main() {
     std::unique_ptr<pcap_if_t, PcapIfDeleter> alldevs(alldevs_raw);
 
     pcap_if_t* d = nullptr;
-    for (d = alldevs.get(); d != nullptr; d = d->next) {
-        if (!(d->flags & PCAP_IF_LOOPBACK)) {
-            break;
+    if (argc > 1) {
+        const char* target = argv[1];
+        for (pcap_if_t* iter = alldevs.get(); iter != nullptr; iter = iter->next) {
+            if (std::strcmp(iter->name, target) == 0) {
+                d = iter;
+                break;
+            }
         }
+        if (d == nullptr) {
+            fprintf(stderr, "Interface %s not found. Available devices:\n", target);
+            for (pcap_if_t* iter = alldevs.get(); iter != nullptr; iter = iter->next) {
+                fprintf(stderr, " - %s\n", iter->name);
+            }
+            return 2;
+        }
+    } else {
+        for (d = alldevs.get(); d != nullptr; d = d->next) {
+            if (!(d->flags & PCAP_IF_LOOPBACK)) {
+                break;
+            }
+        }
+        if (d == nullptr) d = alldevs.get();
     }
-    if (d == nullptr) d = alldevs.get();
 
     if (d == nullptr) {
         fprintf(stderr, "No interfaces found! Make sure libpcap is installed.\n");
@@ -277,13 +356,13 @@ int main() {
         std::memset(&serv_addr, 0, sizeof(serv_addr));
         serv_addr.sin_family = AF_INET;
         serv_addr.sin_port = htons(DEST_PORT);
-        if (inet_pton(AF_INET, DEST_IP, &serv_addr.sin_addr) <= 0) {
-            fprintf(stderr, "Invalid address: %s\n", DEST_IP);
+        if (inet_pton(AF_INET, dest_ip, &serv_addr.sin_addr) <= 0) {
+            fprintf(stderr, "Invalid address: %s\n", dest_ip);
             close(sockfd);
             return 1;
         }
 
-        std::cout << "[INFO] Connecting to Rust service at " << DEST_IP << ":" << DEST_PORT << "...\n" << std::flush;
+        std::cout << "[INFO] Connecting to Rust service at " << dest_ip << ":" << dest_port << "...\n" << std::flush;
         if (connect(sockfd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) == 0) {
             ssl.reset(SSL_new(ctx.get()));
             if (!ssl) {

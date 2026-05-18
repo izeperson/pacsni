@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  rust_service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pacsni_rust_service
+    network_mode: "host"
+    command: ["/app/rust/packet_service"]
+    restart: on-failure
+
+  go_dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pacsni_go_dashboard
+    network_mode: "host"
+    volumes:
+      - geocache_data:/app/go/dashboard/geocache.json
+    environment:
+      RUST_SERVICE_HOST: 127.0.0.1
+      RUST_SERVICE_PORT: 9003
+    command: ["/app/go/dashboard/dashboard"]
+    restart: on-failure
+
+  cpp_capture:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pacsni_cpp_capture
+    network_mode: "host"
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    depends_on:
+      - rust_service
+    environment:
+      RUST_SERVICE_HOST: 127.0.0.1
+      RUST_SERVICE_PORT: 9001
+    command: ["/app/cpp/packet_capture"]
+    restart: on-failure
+
+volumes:
+  geocache_data:

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"container/list"
 	"embed"
 	"encoding/binary"
 	"encoding/json"
@@ -45,7 +46,7 @@ func getPacketInfo(pkt *DashboardPacket) string {
 
 type RingBuffer struct {
 	mu    sync.RWMutex
-	data  []DashboardPacket
+	data  []interface{}
 	size  int
 	head  int
 	count int
@@ -53,12 +54,12 @@ type RingBuffer struct {
 
 func NewRingBuffer(size int) *RingBuffer {
 	return &RingBuffer{
-		data: make([]DashboardPacket, size),
+		data: make([]interface{}, size),
 		size: size,
 	}
 }
 
-func (r *RingBuffer) Add(p DashboardPacket) {
+func (r *RingBuffer) Add(p interface{}) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.data[r.head] = p
@@ -75,10 +76,10 @@ func (r *RingBuffer) Clear() {
 	r.count = 0
 }
 
-func (r *RingBuffer) GetAll(reversed bool) []DashboardPacket {
+func (r *RingBuffer) GetAll(reversed bool) []interface{} {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	res := make([]DashboardPacket, r.count)
+	res := make([]interface{}, r.count)
 	for i := 0; i < r.count; i++ {
 		var idx int
 		if reversed {
@@ -104,11 +105,92 @@ var (
 	filterStr     = ""
 	packetCounter = 0
 	seenIPs       = make(map[string]bool)
-	geoCache      = make(map[string]string)
+	geoCache      = NewLRUCache(10000)
 	mu            sync.Mutex
-	geoMu         sync.Mutex
 	geoReqChan    = make(chan string, 1000)
 )
+
+type lruEntry struct {
+	key   string
+	value string
+}
+
+type lruCache struct {
+	capacity int
+	cache    map[string]*list.Element
+	list     *list.List
+	mu       sync.Mutex
+}
+
+func NewLRUCache(capacity int) *lruCache {
+	return &lruCache{
+		capacity: capacity,
+		cache:    make(map[string]*list.Element),
+		list:     list.New(),
+	}
+}
+
+func (c *lruCache) Get(key string) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if element, found := c.cache[key]; found {
+		c.list.MoveToFront(element)
+		return element.Value.(*lruEntry).value, true
+	}
+	return "", false
+}
+
+func (c *lruCache) Add(key, value string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if element, found := c.cache[key]; found {
+		c.list.MoveToFront(element)
+		element.Value.(*lruEntry).value = value
+		return
+	}
+	if c.list.Len() >= c.capacity {
+		oldest := c.list.Back()
+		if oldest != nil {
+			c.list.Remove(oldest)
+			delete(c.cache, oldest.Value.(*lruEntry).key)
+		}
+	}
+	entry := &lruEntry{key: key, value: value}
+	element := c.list.PushFront(entry)
+	c.cache[key] = element
+}
+
+func (c *lruCache) Remove(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if element, found := c.cache[key]; found {
+		c.list.Remove(element)
+		delete(c.cache, key)
+	}
+}
+
+func (c *lruCache) GetAll() map[string]string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	allEntries := make(map[string]string, c.list.Len())
+	for _, element := range c.cache {
+		entry := element.Value.(*lruEntry)
+		allEntries[entry.key] = entry.value
+	}
+	return allEntries
+}
+
+func (c *lruCache) Load(data map[string]string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cache = make(map[string]*list.Element)
+	c.list = list.New()
+	for key, value := range data {
+		entry := &lruEntry{key: key, value: value}
+		element := c.list.PushFront(entry)
+		c.cache[key] = element
+	}
+}
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
@@ -146,72 +228,67 @@ func getCountry(ip string) string {
 	if isPrivateIP(ip) {
 		return "local"
 	}
-	geoMu.Lock()
-	if c, ok := geoCache[ip]; ok {
-		geoMu.Unlock()
+	if c, ok := geoCache.Get(ip); ok {
 		return c
 	}
-	geoCache[ip] = "searching..."
-	geoMu.Unlock()
-
 	select {
 	case geoReqChan <- ip:
 	default:
 	}
-
 	return "searching..."
 }
 
 func geoWorker() {
 	ticker := time.NewTicker(1500 * time.Millisecond)
 	defer ticker.Stop()
-
 	client := &http.Client{Timeout: 5 * time.Second}
-
 	for ip := range geoReqChan {
 		<-ticker.C
 		resp, err := client.Get(fmt.Sprintf("http://ip-api.com/json/%s?fields=country", ip))
 		if err != nil {
+			fmt.Fprintf(os.Stderr, "[GEO ERROR] Request failed for %s: %v\n", ip, err)
 			continue
 		}
-
+		if resp.StatusCode == http.StatusTooManyRequests {
+			fmt.Fprintf(os.Stderr, "[GEO ERROR] Rate limit hit for %s. Sleeping 1m...\n", ip)
+			resp.Body.Close()
+			time.Sleep(1 * time.Minute)
+			continue
+		}
 		var res struct {
 			Country string `json:"country"`
 		}
 		if err := json.NewDecoder(resp.Body).Decode(&res); err == nil && res.Country != "" {
-			geoMu.Lock()
-			geoCache[ip] = strings.ToLower(res.Country)
-			geoMu.Unlock()
-
+			geoCache.Add(ip, strings.ToLower(res.Country))
 			saveGeoCacheToDisk()
-
 			broadcast(map[string]interface{}{
 				"type":    "geo_update",
 				"ip":      ip,
 				"country": strings.ToLower(res.Country),
 			})
 		} else {
-			geoMu.Lock()
-			delete(geoCache, ip)
-			geoMu.Unlock()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[GEO ERROR] Failed to decode response for %s: %v\n", ip, err)
+			}
+			geoCache.Remove(ip)
 		}
 		resp.Body.Close()
 	}
 }
 
 func saveGeoCacheToDisk() {
-	geoMu.Lock()
-	defer geoMu.Unlock()
-	if data, err := json.Marshal(geoCache); err == nil {
+	dataToSave := geoCache.GetAll()
+	if data, err := json.Marshal(dataToSave); err == nil {
 		os.WriteFile("geocache.json", data, 0644)
 	}
 }
 
 func loadGeoCache() {
-	geoMu.Lock()
-	defer geoMu.Unlock()
 	if data, err := os.ReadFile("geocache.json"); err == nil {
-		json.Unmarshal(data, &geoCache)
+		var loadedMap map[string]string
+		if json.Unmarshal(data, &loadedMap) == nil {
+			geoCache.Load(loadedMap)
+		}
 	}
 }
 
@@ -243,6 +320,16 @@ func serveWs(w http.ResponseWriter, r *http.Request) {
 func main() {
 	packetChan := make(chan DashboardPacket, 1000)
 
+	rustServiceHost := os.Getenv("RUST_SERVICE_HOST")
+	if rustServiceHost == "" {
+		rustServiceHost = "127.0.0.1"
+	}
+	rustServicePort := os.Getenv("RUST_SERVICE_PORT")
+	if rustServicePort == "" {
+		rustServicePort = "9003"
+	}
+	rustServiceAddr := net.JoinHostPort(rustServiceHost, rustServicePort)
+
 	loadGeoCache()
 
 	go geoWorker()
@@ -265,7 +352,7 @@ func main() {
 			}
 
 			dialer := net.Dialer{Timeout: 5 * time.Second}
-			conn, err := dialer.Dial("tcp", "127.0.0.1:9003")
+			conn, err := dialer.Dial("tcp", rustServiceAddr)
 			if err != nil {
 				consecutiveFailures++
 				continue
@@ -384,7 +471,7 @@ func main() {
 		binary.Write(w, binary.LittleEndian, uint32(1))
 
 		for i := 0; i < len(history); i++ {
-			p := history[i]
+			p := history[i].(DashboardPacket)
 			payload := p.Payload
 			sec := uint32(p.Timestamp / 1000000)
 			usec := uint32(p.Timestamp % 1000000)
