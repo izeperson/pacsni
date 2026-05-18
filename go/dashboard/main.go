@@ -44,22 +44,22 @@ func getPacketInfo(pkt *DashboardPacket) string {
 	}
 }
 
-type RingBuffer struct {
+type RingBuffer[T any] struct {
 	mu    sync.RWMutex
-	data  []interface{}
+	data  []T
 	size  int
 	head  int
 	count int
 }
 
-func NewRingBuffer(size int) *RingBuffer {
-	return &RingBuffer{
-		data: make([]interface{}, size),
+func NewRingBuffer[T any](size int) *RingBuffer[T] {
+	return &RingBuffer[T]{
+		data: make([]T, size),
 		size: size,
 	}
 }
 
-func (r *RingBuffer) Add(p interface{}) {
+func (r *RingBuffer[T]) Add(p T) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.data[r.head] = p
@@ -69,17 +69,17 @@ func (r *RingBuffer) Add(p interface{}) {
 	}
 }
 
-func (r *RingBuffer) Clear() {
+func (r *RingBuffer[T]) Clear() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.head = 0
 	r.count = 0
 }
 
-func (r *RingBuffer) GetAll(reversed bool) []interface{} {
+func (r *RingBuffer[T]) GetAll(reversed bool) []T {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	res := make([]interface{}, r.count)
+	res := make([]T, r.count)
 	for i := 0; i < r.count; i++ {
 		var idx int
 		if reversed {
@@ -96,11 +96,10 @@ func (r *RingBuffer) GetAll(reversed bool) []interface{} {
 	return res
 }
 
-//go:embed index.html
 var content embed.FS
 
 var (
-	historyBuffer = NewRingBuffer(5000)
+	historyBuffer = NewRingBuffer[DashboardPacket](5000)
 	isScanning    = true
 	filterStr     = ""
 	packetCounter = 0
@@ -471,7 +470,7 @@ func main() {
 		binary.Write(w, binary.LittleEndian, uint32(1))
 
 		for i := 0; i < len(history); i++ {
-			p := history[i].(DashboardPacket)
+			p := history[i]
 			payload := p.Payload
 			sec := uint32(p.Timestamp / 1000000)
 			usec := uint32(p.Timestamp % 1000000)
