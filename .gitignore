@@ -5,3 +5,4 @@ rust/packet_service/target
 server.crt
 server.key
 rust/packet_service/Cargo.lock
+geocache.json

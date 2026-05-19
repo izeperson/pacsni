@@ -35,7 +35,7 @@ type DashboardPacket struct {
 func getPacketInfo(pkt *DashboardPacket) string {
 	aoSuffix := ""
 	if pkt.HasTcpAo {
-		aoSuffix = " [TCP-AO]"
+		aoSuffix = " <span class='badge-ao'>AO</span>"
 	}
 	switch pkt.Protocol {
 	case "TCP":
@@ -101,6 +101,7 @@ func (r *RingBuffer[T]) GetAll(reversed bool) []T {
 	return res
 }
 
+//go:embed index.html script.js
 var content embed.FS
 
 var (
@@ -543,6 +544,16 @@ func main() {
 			StatusLabel: statusLabel,
 			IsScanning:  isScanning,
 		})
+	})
+
+	http.HandleFunc("/script.js", func(w http.ResponseWriter, r *http.Request) {
+		data, err := content.ReadFile("script.js")
+		if err != nil {
+			http.Error(w, "Script not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/javascript")
+		w.Write(data)
 	})
 
 	http.HandleFunc("/ws", serveWs)
