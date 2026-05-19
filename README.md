@@ -56,7 +56,7 @@ A high-performance, multi-language packet analysis system built with C++, Rust, 
 - **Linux/macOS**: libpcap development headers
 - **Rust**: Latest stable toolchain (via rustup)
 - **Go**: Version 1.19 or higher
-- **C++ Compiler**: GCC or Clang with C++11 support
+- **C++ Compiler**: GCC or Clang with C++17 support
 
 ### Installation
 
