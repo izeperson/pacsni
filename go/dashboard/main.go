@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -19,31 +20,85 @@ import (
 )
 
 type DashboardPacket struct {
-	Timestamp uint64 `json:"timestamp"`
-	SrcIP     string `json:"src_ip"`
-	DstIP     string `json:"dst_ip"`
-	SrcPort   uint16 `json:"src_port"`
-	DstPort   uint16 `json:"dst_port"`
-	Protocol  string `json:"protocol"`
-	HasTcpAo  bool   `json:"has_tcp_ao"`
-	Payload   []byte `json:"payload"`
-	Index     int    `json:"index"`
-	Info      string `json:"info"`
-	Country   string `json:"country"`
+	Timestamp    uint64 `json:"timestamp"`
+	SrcIP        string `json:"src_ip"`
+	DstIP        string `json:"dst_ip"`
+	SrcPort      uint16 `json:"src_port"`
+	DstPort      uint16 `json:"dst_port"`
+	SrcMAC       string `json:"src_mac"`
+	DstMAC       string `json:"dst_mac"`
+	Protocol     string `json:"protocol"`
+	HasTcpAo     bool   `json:"has_tcp_ao"`
+	TcpFlags     uint8  `json:"tcp_flags"`
+	L3Offset     uint8  `json:"l3_offset"`
+	L4Offset     uint8  `json:"l4_offset"`
+	Payload      []byte `json:"payload"`
+	Index        int    `json:"index"`
+	Info         string `json:"info"`
+	SrcMacVendor string `json:"src_mac_vendor"`
+	DstMacVendor string `json:"dst_mac_vendor"`
+	Country      string `json:"country"`
 }
 
 func getPacketInfo(pkt *DashboardPacket) string {
-	aoSuffix := ""
-	if pkt.HasTcpAo {
-		aoSuffix = " <span class='badge-ao'>AO</span>"
+	if pkt.SrcPort == 53 || pkt.DstPort == 53 {
+		return fmt.Sprintf("DNS Message %d -> %d", pkt.SrcPort, pkt.DstPort)
 	}
+
 	switch pkt.Protocol {
 	case "TCP":
-		return fmt.Sprintf("%d -> %d [ack] seq=0 ack=0 win=64240 len=%d%s", pkt.SrcPort, pkt.DstPort, len(pkt.Payload), aoSuffix)
+		var flags []string
+		if pkt.TcpFlags&0x02 != 0 { // SYN
+			flags = append(flags, "<span style='color:#fbbf24; font-weight:800;'>SYN</span>")
+		}
+		if pkt.TcpFlags&0x01 != 0 { // FIN
+			flags = append(flags, "<span style='color:#a855f7; font-weight:800;'>FIN</span>")
+		}
+		if pkt.TcpFlags&0x04 != 0 { // RST
+			flags = append(flags, "<span style='color:#f43f5e; font-weight:800;'>RST</span>")
+		}
+		if pkt.TcpFlags&0x10 != 0 { // ACK
+			flags = append(flags, "ACK")
+		}
+		if pkt.TcpFlags&0x08 != 0 { // PSH
+			flags = append(flags, "PSH")
+		}
+
+		info := fmt.Sprintf("%d -> %d", pkt.SrcPort, pkt.DstPort)
+		if len(flags) > 0 {
+			info += " [" + strings.Join(flags, ",") + "]"
+		}
+		return fmt.Sprintf("%s seq=0 ack=0 win=64240 len=%d", info, len(pkt.Payload))
 	case "UDP":
 		return fmt.Sprintf("%d -> %d len=%d", pkt.SrcPort, pkt.DstPort, len(pkt.Payload))
+	case "DHCP":
+		return fmt.Sprintf("DHCP Message %d -> %d len=%d", pkt.SrcPort, pkt.DstPort, len(pkt.Payload))
+	case "HTTP":
+		return fmt.Sprintf("HTTP Request/Response %d -> %d len=%d", pkt.SrcPort, pkt.DstPort, len(pkt.Payload))
 	case "ICMP":
 		return "echo (ping) request"
+	case "ARP":
+		srcVendor := ""
+		if pkt.SrcMacVendor != "" {
+			srcVendor = fmt.Sprintf(" (%s)", pkt.SrcMacVendor)
+		}
+		dstVendor := ""
+		if pkt.DstMacVendor != "" {
+			dstVendor = fmt.Sprintf(" (%s)", pkt.DstMacVendor)
+		}
+		return fmt.Sprintf("ARP Request/Reply %s%s -> %s%s", pkt.SrcIP, srcVendor, pkt.DstIP, dstVendor)
+	case "ND":
+		return "Neighbor Discovery (Solicitation/Advertisement)"
+	case "ICMPv6":
+		return "ICMPv6 Control Message"
+	case "OSPF":
+		return "OSPF Routing Protocol Message"
+	case "STP":
+		dstVendor := ""
+		if pkt.DstMacVendor != "" {
+			dstVendor = fmt.Sprintf(" (%s)", pkt.DstMacVendor)
+		}
+		return fmt.Sprintf("Spanning Tree Protocol Message to %s%s", pkt.DstMAC, dstVendor)
 	default:
 		return fmt.Sprintf("protocol %s message", strings.ToLower(pkt.Protocol))
 	}
@@ -108,6 +163,7 @@ var (
 	historyBuffer = NewRingBuffer[DashboardPacket](5000)
 	isScanning    = true
 	filterStr     = ""
+	filterRegex   *regexp.Regexp
 	packetCounter = 0
 	seenIPs       = make(map[string]bool)
 	geoCache      = NewLRUCache(10000)
@@ -226,7 +282,8 @@ func isPrivateIP(ipStr string) bool {
 	if parsed == nil {
 		return true
 	}
-	return parsed.IsLoopback() || parsed.IsPrivate() || parsed.IsUnspecified()
+	// Treat non-global unicast (loopback, link-local, etc.) or RFC1918 private IPs as local
+	return !parsed.IsGlobalUnicast() || parsed.IsPrivate()
 }
 
 func getCountry(ip string) string {
@@ -241,6 +298,39 @@ func getCountry(ip string) string {
 	default:
 	}
 	return "searching..."
+}
+
+var macVendors = map[string]string{
+	"00:00:00": "Xerox",
+	"00:00:0C": "Cisco",
+	"00:00:0F": "Fujitsu",
+	"00:00:1C": "Intel",
+	"00:00:2D": "Apple",
+	"00:00:33": "IBM",
+	"00:00:3F": "Motorola",
+	"00:00:5E": "IANA",
+	"00:00:86": "HP",
+	"00:00:A7": "Dell",
+	"00:00:C0": "Western Digital",
+	"00:00:E8": "Samsung",
+	"00:01:42": "Microsoft",
+	"00:01:4F": "Netgear",
+	"00:01:6C": "Linksys",
+	"00:01:96": "Huawei",
+	"00:02:B3": "Google",
+	"00:03:93": "Juniper",
+	"00:04:20": "Nokia",
+	"00:05:00": "VMware",
+	"00:05:1A": "Broadcom",
+	"00:05:9A": "D-Link",
+}
+
+func getMacVendor(mac string) string {
+	if len(mac) < 8 {
+		return ""
+	}
+	oui := strings.ToUpper(mac[0:8])
+	return macVendors[oui]
 }
 
 func geoWorker() {
@@ -411,6 +501,10 @@ func main() {
 			} else {
 				pkt.Country = "local"
 			}
+			if pkt.Protocol == "ARP" || pkt.Protocol == "STP" { // Only lookup for protocols where MAC vendor is relevant
+				pkt.SrcMacVendor = getMacVendor(pkt.SrcMAC)
+				pkt.DstMacVendor = getMacVendor(pkt.DstMAC)
+			}
 
 			match := false
 			if filterStr == "" {
@@ -421,10 +515,52 @@ func main() {
 					match = (pkt.SrcIP == f[1] && fmt.Sprintf("%d", pkt.SrcPort) == f[2] && pkt.DstIP == f[3] && fmt.Sprintf("%d", pkt.DstPort) == f[4]) ||
 						(pkt.SrcIP == f[3] && fmt.Sprintf("%d", pkt.SrcPort) == f[4] && pkt.DstIP == f[1] && fmt.Sprintf("%d", pkt.DstPort) == f[2])
 				}
+			} else if filterRegex != nil {
+				match = filterRegex.MatchString(pkt.Protocol) ||
+					filterRegex.MatchString(pkt.SrcIP) ||
+					filterRegex.MatchString(pkt.DstIP) ||
+					filterRegex.MatchString(pkt.Info) ||
+					filterRegex.MatchString(pkt.Country)
 			} else {
-				match = strings.Contains(strings.ToLower(pkt.Protocol), strings.ToLower(filterStr)) ||
-					strings.Contains(pkt.SrcIP, filterStr) ||
-					strings.Contains(pkt.DstIP, filterStr)
+				match = true
+				parts := strings.Fields(strings.ToLower(filterStr))
+				lowProto := strings.ToLower(pkt.Protocol)
+				lowSrc := strings.ToLower(pkt.SrcIP)
+				lowDst := strings.ToLower(pkt.DstIP)
+				lowInfo := strings.ToLower(pkt.Info)
+				lowCountry := strings.ToLower(pkt.Country)
+
+				for _, part := range parts {
+					negate := strings.HasPrefix(part, "-")
+					checkPart := part
+					if negate {
+						checkPart = strings.TrimPrefix(part, "-")
+					}
+					partMatch := strings.Contains(lowProto, checkPart) ||
+						strings.Contains(lowSrc, checkPart) ||
+						strings.Contains(lowDst, checkPart) ||
+						strings.Contains(lowInfo, checkPart) ||
+						strings.Contains(lowCountry, checkPart) ||
+						((checkPart == "tcp-ao" || checkPart == "ao") && pkt.HasTcpAo)
+					if negate {
+						partMatch = !partMatch
+					}
+
+					// Functional CIDR support: if it looks like CIDR, perform a subnet check
+					if !partMatch && strings.Contains(checkPart, "/") {
+						if _, ipnet, err := net.ParseCIDR(checkPart); err == nil {
+							found := ipnet.Contains(net.ParseIP(pkt.SrcIP)) || ipnet.Contains(net.ParseIP(pkt.DstIP))
+							partMatch = found
+							if negate {
+								partMatch = !found
+							}
+						}
+					}
+					if !partMatch {
+						match = false
+						break
+					}
+				}
 			}
 
 			if match {
@@ -513,6 +649,11 @@ func main() {
 			mu.Lock()
 			if filterStr != f[0] {
 				filterStr = f[0]
+				if strings.HasPrefix(strings.ToLower(filterStr), "regex:") {
+					filterRegex, _ = regexp.Compile("(?i)" + filterStr[6:])
+				} else {
+					filterRegex = nil
+				}
 				broadcast(map[string]interface{}{"type": "status", "isScanning": isScanning, "filter": filterStr})
 			}
 			mu.Unlock()

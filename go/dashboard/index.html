@@ -1,3 +1,4 @@
+<!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
@@ -14,7 +15,7 @@
             --text: #18181b; --muted: #71717a; --accent: #d4d4d8; --highlight: #2563eb;
         }
 
-        body { font-family: 'inter', sans-serif; background: var(--bg); color: var(--text); margin: 0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+        body { font-family: 'inter', sans-serif; background: var(--bg); color: var(--text); margin: 0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; width: 100vw; }
         
         ::-webkit-scrollbar { width: 8px; height: 8px; }
         ::-webkit-scrollbar-track { background: var(--bg); }
@@ -24,14 +25,14 @@
         .toolbar { background: var(--surf); padding: 10px 20px; display: flex; gap: 15px; border-bottom: 1px solid var(--border); align-items: center; z-index: 50; }
         .toolbar h1 { margin: 0; font-size: 16px; font-weight: 800; color: var(--text); letter-spacing: -0.05em; margin-right: 20px; }
         
-        .pane-list { height: 70%; flex: none; overflow-y: auto; border-bottom: 1px solid var(--border); }
+        .pane-list { height: 70%; flex: none; overflow-y: auto; overflow-x: hidden; border-bottom: 1px solid var(--border); }
         .resizer { height: 6px; background: var(--border); cursor: ns-resize; flex-shrink: 0; transition: background 0.2s; z-index: 100; border-top: 1px solid var(--bg); border-bottom: 1px solid var(--bg); }
         .resizer:hover { background: var(--highlight); }
-        .pane-detail { height: 15%; flex: none; overflow-y: auto; background: var(--surf); padding: 15px; border-bottom: 1px solid var(--border); }
+        .pane-detail { height: 150px; flex: none; overflow-y: auto; background: var(--surf); padding: 15px; border-bottom: 1px solid var(--border); }
         .pane-hex { flex: 1; overflow-y: auto; background: var(--bg); font-family: 'fira code', monospace; padding: 15px; font-size: 11px; white-space: pre; color: #10b981; }
         
-        table { width: 100%; border-collapse: collapse; table-layout: fixed; }
-        th { background: var(--surf); position: sticky; top: 0; text-align: left; padding: 10px 8px; font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; border-bottom: 1px solid var(--border); z-index: 10; }
+        table { width: 100%; border-collapse: separate; border-spacing: 0; table-layout: fixed; }
+        th { background: var(--surf); position: sticky; top: 0; text-align: left; padding: 10px 8px; font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; border-bottom: 1px solid var(--border); z-index: 10; transform: translateZ(0); backface-visibility: hidden; }
         td { padding: 0 8px; height: 32px; font-size: 12px; border-bottom: 1px solid rgba(255,255,255,0.02); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; transition: background 0.1s; }
         tr:hover { background: rgba(255,255,255,0.03); }
         tr.selected { background: var(--highlight) !important; color: white; }
@@ -41,9 +42,15 @@
         .proto-UDP { color: #ccc; }
         .proto-ICMP { color: #aaa; }
         .badge-ao { background: #f59e0b; color: #000; font-size: 9px; padding: 1px 4px; border-radius: 3px; font-weight: 800; margin-left: 6px; vertical-align: middle; display: inline-block; line-height: 1; }
+        .empty-packet { opacity: 0.6; }
+        .len-zero { color: var(--muted); font-style: italic; }
         
         .detail-item { margin-bottom: 6px; font-size: 13px; border-left: 2px solid var(--border); padding-left: 10px; }
         .detail-item b { color: var(--muted); display: block; font-size: 11px; margin-bottom: 2px; }
+        .detail-item.highlight { background: rgba(59, 130, 246, 0.2); border-left-color: var(--highlight); }
+        .detail-item { transition: all 0.1s ease; border-radius: 0 4px 4px 0; padding: 4px 10px; cursor: default; }
+
+        .hex-byte.hover { background: var(--highlight); color: white !important; border-radius: 2px; }
         .selected .detail-item b { color: white; opacity: 0.8; }
 
         .btn { background: var(--surf); border: 1px solid var(--border); color: var(--text); padding: 6px 12px; border-radius: 6px; font-size: 12px; font-weight: 500; cursor: pointer; transition: all 0.2s; }
@@ -51,13 +58,27 @@
         .btn-primary { background: #3b82f6; border-color: #3b82f6; color: white; }
         .btn-primary:hover { background: #2563eb; border-color: #2563eb; }
         
-        input { background: var(--bg); border: 1px solid var(--border); padding: 6px 12px; border-radius: 6px; color: white; width: 300px; font-size: 12px; }
-        input::placeholder { color: var(--muted); }
-        body.light-mode input { color: var(--text); }
-        input:focus { outline: none; border-color: var(--accent); }
+        .filter-container { position: relative; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; width: 320px; height: 30px; display: flex; align-items: center; overflow: hidden; }
+        .filter-input { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: transparent; border: none; color: transparent; caret-color: var(--text); padding: 0 12px; font-family: 'fira code', monospace; font-size: 12px; z-index: 2; outline: none; line-height: 30px; }
+        .filter-highlight { position: absolute; top: 0; left: 0; width: 100%; height: 100%; padding: 0 12px; line-height: 30px; font-family: 'fira code', monospace; font-size: 12px; color: var(--muted); pointer-events: none; white-space: pre; z-index: 1; display: flex; align-items: center; }
+        
+        .hl-key { color: #3b82f6; font-weight: bold; }
+        .hl-num { color: #10b981; }
+        .hl-proto { color: #f59e0b; font-weight: bold; }
+        .hl-regex { color: #ec4899; }
+        .hl-neg { color: #f43f5e; font-weight: bold; }
+        
+        .search-input { background: var(--bg); border: 1px solid var(--border); padding: 0 12px; border-radius: 6px; color: var(--text); font-size: 12px; height: 30px; outline: none; transition: all 0.2s; box-sizing: border-box; }
+        .search-input:focus { border-color: var(--highlight); background: var(--surf); }
+        .search-input::placeholder { color: var(--muted); opacity: 0.5; }
 
         .status-tag { font-size: 10px; padding: 2px 8px; border-radius: 10px; background: rgba(16, 185, 129, 0.1); color: #10b981; }
         .status-paused { background: rgba(244, 63, 94, 0.1); color: #f43f5e; }
+
+        .autocomplete-box { position: absolute; top: 32px; left: 0; background: var(--surf); border: 1px solid var(--border); width: 100%; z-index: 1000; border-radius: 4px; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.5); display: none; }
+        .suggestion-item { padding: 6px 12px; cursor: pointer; font-size: 11px; color: var(--text); border-bottom: 1px solid rgba(255,255,255,0.05); }
+        .suggestion-item:last-child { border-bottom: none; }
+        .suggestion-item:hover, .suggestion-item.active { background: var(--highlight); color: white; }
 
         #context-menu {
             position: fixed; background: var(--surf); border: 1px solid var(--border);
@@ -78,23 +99,22 @@
             <button name="action" value="toggle" class="btn btn-primary">{{.BtnText}}</button>
             <button name="action" value="clear" class="btn">Clear History</button>
             <button type="button" onclick="window.location.href='/api/export'" class="btn">Export PCAP</button>
-            <input type="text" name="filter" list="filter-suggestions" placeholder="Filter Packets (e.g. TCP, Stream...)" value="{{.Filter}}">
-            <datalist id="filter-suggestions">
-                <option value="tcp">
-                <option value="udp">
-                <option value="icmp">
-                <option value="127.0.0.1">
-                <option value="stream:127.0.0.1:">
-            </datalist>
+            <button type="button" onclick="if(confirm('Are you sure you want to shutdown pacsni?')) fetch('/api/quit')" class="btn" style="border-color: #f43f5e; color: #f43f5e;">Shutdown pacsni</button>
+            <div class="filter-container">
+                <div id="filter-highlight" class="filter-highlight"></div>
+                <input type="text" id="filter-input" name="filter" class="filter-input" value="{{.Filter}}" autocomplete="off" oninput="handleFilterInput(event)" onkeydown="handleFilterKey(event)">
+                <div id="autocomplete-box" class="autocomplete-box"></div>
+            </div>
             <button type="submit" class="btn">apply filter</button>
         </form>
         <div class="settings-group">
             <label>Auto-scroll</label>
             <input type="checkbox" id="auto-scroll" checked style="width: auto;">
             <button type="button" onclick="toggleTheme()" class="btn" id="theme-toggle" style="margin-left: 10px;">Light Mode</button>
+            <div style="margin-left: 15px; display: flex; align-items: center; gap: 5px;"><span class="badge-ao" title="TCP Authentication Option (RFC 5925)">AO</span> <span style="font-size: 10px; color: var(--muted)">TCP Auth Option</span></div>
         </div>
         <div id="status-label" class="status-tag" style="margin-left: auto;">{{.StatusLabel}}</div>
-        <input type="text" id="local-search" placeholder="Search current view..." oninput="updateSearch(this.value)" style="width: 200px; margin-left: 10px;">
+        <input type="text" id="local-search" class="search-input" placeholder="Search current view..." oninput="updateSearch(this.value)" style="width: 200px; margin-left: 10px;">
     </div>
 
     <div class="pane-list" id="pane-list">
@@ -116,6 +136,7 @@
     </div>
     <div class="resizer" id="resizer"></div>
     <div class="pane-detail" id="pane-detail"></div>
+    <div class="resizer" id="resizer-detail"></div>
     <div class="pane-hex" id="pane-hex"></div>
 
     <script src="script.js"></script>

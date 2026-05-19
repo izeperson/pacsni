@@ -15,7 +15,7 @@ use std::fs::File;
 use std::io::BufReader;
 
 const SHARED_SECRET: &[u8] = b"pacsni_secure_shared_secret_123";
-const STRUCT_SIZE: usize = 164;
+const STRUCT_SIZE: usize = 295;
 const HASH_SIZE: usize = 64;
 const TOTAL_MSG_SIZE: usize = STRUCT_SIZE + HASH_SIZE;
 
@@ -28,6 +28,9 @@ struct DashboardPacket {
     dst_port: u16,
     protocol: String,
     has_tcp_ao: bool,
+    tcp_flags: u8,
+    l3_offset: u8,
+    l4_offset: u8,
     payload: Vec<u8>,
     src_mac: String,
     dst_mac: String,
@@ -44,11 +47,28 @@ fn mac_addr_to_string(mac: &[u8; 6]) -> String {
     )
 }
 
-fn protocol_to_string(proto: u8) -> String {
+fn protocol_to_string(proto: u8, src_port: u16, dst_port: u16) -> String {
     match proto {
         1 => "ICMP".to_string(),
-        6 => "TCP".to_string(),
-        17 => "UDP".to_string(),
+        6 => {
+            if src_port == 80 || dst_port == 80 {
+                "HTTP".to_string()
+            } else {
+                "TCP".to_string()
+            }
+        },
+        17 => {
+            if src_port == 67 || src_port == 68 || dst_port == 67 || dst_port == 68 {
+                "DHCP".to_string()
+            } else {
+                "UDP".to_string()
+            }
+        },
+        58 => "ICMPv6".to_string(),
+        89 => "OSPF".to_string(),
+        200 => "ARP".to_string(),
+        201 => "ND".to_string(),
+        202 => "STP".to_string(),
         _ => format!("Unknown({})", proto),
     }
 }
@@ -207,6 +227,9 @@ async fn handle_cpp_connection<S: io::AsyncRead + io::AsyncWrite + Unpin>(mut so
             let dst_port = buffer.get_u16_le();
             let protocol = buffer.get_u8();
             let has_tcp_ao = buffer.get_u8() != 0;
+            let tcp_flags = buffer.get_u8();
+            let l3_offset = buffer.get_u8();
+            let l4_offset = buffer.get_u8();
             let payload_len = buffer.get_u16_le();
             
             let mut src_mac_raw = [0u8; 6];
@@ -214,12 +237,12 @@ async fn handle_cpp_connection<S: io::AsyncRead + io::AsyncWrite + Unpin>(mut so
             let mut dst_mac_raw = [0u8; 6];
             buffer.copy_to_slice(&mut dst_mac_raw);
 
-            let mut payload_raw = [0u8; 128];
+            let mut payload_raw = [0u8; 256];
             buffer.copy_to_slice(&mut payload_raw);
             
             buffer.advance(HASH_SIZE);
 
-            let valid_len = (payload_len as usize).min(128);
+            let valid_len = (payload_len as usize).min(256);
             let valid_payload = &payload_raw[..valid_len];
             
             let packet = DashboardPacket {
@@ -228,8 +251,11 @@ async fn handle_cpp_connection<S: io::AsyncRead + io::AsyncWrite + Unpin>(mut so
                 dst_ip: ip_addr_to_string(&dst_ip_raw.to_be_bytes()),
                 src_port,
                 dst_port,
-                protocol: protocol_to_string(protocol),
+                protocol: protocol_to_string(protocol, src_port, dst_port),
                 has_tcp_ao,
+                tcp_flags,
+                l3_offset,
+                l4_offset,
                 payload: valid_payload.to_vec(),
                 src_mac: mac_addr_to_string(&src_mac_raw),
                 dst_mac: mac_addr_to_string(&dst_mac_raw),

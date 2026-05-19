@@ -3,6 +3,8 @@
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
+#include <netinet/ip6.h>
+#include <netinet/icmp6.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <openssl/ssl.h>
@@ -10,6 +12,7 @@
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/params.h>
+#include <net/if_arp.h>
 #include <netinet/in.h>
 #include <unistd.h>
 #include <cstring>
@@ -24,7 +27,7 @@
 
 const char* DEST_IP = "127.0.0.1";
 const char* SHARED_SECRET = "pacsni_secure_shared_secret_123";
-const int MAX_PAYLOAD_SIZE = 128;
+const int MAX_PAYLOAD_SIZE = 256;
 
 struct __attribute__((__packed__)) PacketInfo {
     uint64_t timestamp;
@@ -34,6 +37,9 @@ struct __attribute__((__packed__)) PacketInfo {
     uint16_t dst_port;
     uint8_t  protocol;
     uint8_t  has_tcp_ao;
+    uint8_t  tcp_flags;
+    uint8_t  l3_offset;
+    uint8_t  l4_offset;
     uint16_t payload_len;
     uint8_t  src_mac[6];
     uint8_t  dst_mac[6];
@@ -72,10 +78,14 @@ struct EvpMacDeleter { void operator()(EVP_MAC* m) { if (m) EVP_MAC_free(m); } }
 struct EvpMacCtxDeleter { void operator()(EVP_MAC_CTX* c) { if (c) EVP_MAC_CTX_free(c); } };
 
 std::atomic<bool> keep_running(true);
+pcap_t* global_pcap_handle = nullptr;
 
 void signal_handler(int sig) {
     (void)sig;
     keep_running = false;
+    if (global_pcap_handle) {
+        pcap_breakloop(global_pcap_handle);
+    }
 }
 
 void log_ssl_error(const std::string& msg) {
@@ -153,10 +163,16 @@ std::optional<EthernetInfo> parse_ethernet_layer(const u_char* packet, uint32_t 
         return std::nullopt;
     }
     const ether_header* eth_header = reinterpret_cast<const ether_header*>(packet);
-    if (ntohs(eth_header->ether_type) != ETHERTYPE_IP) {
-        return std::nullopt;
+    uint16_t etype = ntohs(eth_header->ether_type);
+    int hlen = sizeof(ether_header);
+
+    // Handle IEEE 802.1Q VLAN tagging (TPID 0x8100)
+    if (etype == 0x8100 && caplen >= (uint32_t)(hlen + 4)) {
+        etype = ntohs(*(uint16_t*)(packet + hlen + 2)); // Get underlying type after TCI
+        hlen += 4;
     }
-    return EthernetInfo{eth_header, sizeof(ether_header), ntohs(eth_header->ether_type)};
+
+    return EthernetInfo{eth_header, hlen, etype};
 }
 
 // Helper function to parse IP layer
@@ -220,33 +236,7 @@ void packet_handler(u_char* user_data, const struct pcap_pkthdr* pkthdr, const u
     std::optional<EthernetInfo> eth_info_opt = parse_ethernet_layer(packet, pkthdr->caplen);
     if (!eth_info_opt) return;
     EthernetInfo eth_info = *eth_info_opt;
-
-    // Parse IP Layer
-    std::optional<IpInfo> ip_info_opt = parse_ip_layer(packet, pkthdr->caplen, eth_info.header_len);
-    if (!ip_info_opt) return;
-    IpInfo ip_info = *ip_info_opt;
-
-    // Parse Transport Layer
-    std::optional<TransportInfo> transport_info_opt = parse_transport_layer(packet, pkthdr->caplen, eth_info.header_len, ip_info);
-    if (!transport_info_opt) return;
-    TransportInfo transport_info = *transport_info_opt;
-
-    // Restored functionality: Detect TCP Authentication Option (TCP-AO, Option 29)
-    bool tcp_ao_info_opt = false;
-    if (ip_info.protocol == IPPROTO_TCP) {
-        const tcphdr* tcp = reinterpret_cast<const tcphdr*>(packet + eth_info.header_len + ip_info.header_len);
-        const u_char* options = (const u_char*)(tcp + 1);
-        int opt_len = (tcp->th_off * 4) - sizeof(tcphdr);
-        for (int i = 0; i < opt_len; ) {
-            if (options[i] == 0) break; // End of list
-            if (options[i] == 1) { i++; continue; } // NOP
-            if (options[i] == 29) { tcp_ao_info_opt = true; break; }
-            uint8_t len = (i + 1 < opt_len) ? options[i+1] : 1;
-            if (len < 2) len = 2; // Sanity check
-            i += len;
-        }
-    }
-
+    
     PacketInfo info;
     memset(&info, 0, sizeof(info));
 
@@ -254,22 +244,73 @@ void packet_handler(u_char* user_data, const struct pcap_pkthdr* pkthdr, const u
         pkthdr->ts.tv_sec * 1000000LL + pkthdr->ts.tv_usec
     );
     info.timestamp = duration.count();
-    info.src_ip = ip_info.src_ip;
-    info.dst_ip = ip_info.dst_ip;
-    info.src_port = transport_info.src_port;
-    info.dst_port = transport_info.dst_port;
-    info.protocol = ip_info.protocol;
-    info.has_tcp_ao = tcp_ao_info_opt ? 1 : 0;
-    info.payload_len = (transport_info.payload_len < 0) ? 0 : (uint16_t)transport_info.payload_len;
     memcpy(info.src_mac, eth_info.header->ether_shost, 6);
     memcpy(info.dst_mac, eth_info.header->ether_dhost, 6);
+    info.l3_offset = (uint8_t)eth_info.header_len;
 
-    if (transport_info.payload_len > 0 && transport_info.payload_ptr != nullptr) {
-        uint32_t captured_payload_len = pkthdr->caplen - (uint32_t)(transport_info.payload_ptr - packet);
-        size_t actual_copy = (transport_info.payload_len < (int)captured_payload_len) ? (size_t)transport_info.payload_len : (size_t)captured_payload_len;
-        if (actual_copy > MAX_PAYLOAD_SIZE) actual_copy = MAX_PAYLOAD_SIZE;
-        memcpy(info.payload, transport_info.payload_ptr, actual_copy);
+    if (eth_info.ether_type == ETHERTYPE_IP) {
+        auto ip_info_opt = parse_ip_layer(packet, pkthdr->caplen, eth_info.header_len);
+        if (ip_info_opt) {
+            IpInfo ip_info = *ip_info_opt;
+            info.src_ip = ip_info.src_ip;
+            info.dst_ip = ip_info.dst_ip;
+            info.protocol = ip_info.protocol;
+            info.l4_offset = (uint8_t)(eth_info.header_len + ip_info.header_len);
+            auto transport_info_opt = parse_transport_layer(packet, pkthdr->caplen, eth_info.header_len, ip_info);
+            if (transport_info_opt) {
+                TransportInfo transport_info = *transport_info_opt;
+                info.src_port = transport_info.src_port;
+                info.dst_port = transport_info.dst_port;
+                if (info.protocol == IPPROTO_TCP) {
+                    const tcphdr* tcp = reinterpret_cast<const tcphdr*>(packet + eth_info.header_len + ip_info.header_len);
+                    info.tcp_flags = tcp->th_flags;
+                    const u_char* options = (const u_char*)(tcp + 1);
+                    int opt_len = (tcp->th_off * 4) - sizeof(tcphdr);
+                    for (int i = 0; i < opt_len; ) {
+                        if (options[i] == 0) break;
+                        if (options[i] == 1) { i++; continue; }
+                        if (options[i] == 29) { info.has_tcp_ao = 1; break; }
+                        uint8_t len = (i + 1 < opt_len) ? options[i+1] : 1;
+                        if (len < 2) len = 2;
+                        i += len;
+                    }
+                }
+            }
+        }
+    } else if (eth_info.ether_type == ETHERTYPE_ARP) {
+        info.protocol = 200; // ARP
+        if (pkthdr->caplen >= eth_info.header_len + sizeof(arphdr)) {
+            const arphdr* arp = reinterpret_cast<const arphdr*>(packet + eth_info.header_len);
+            if (ntohs(arp->ar_pro) == ETHERTYPE_IP && arp->ar_pln == 4) {
+                const u_char* arp_ptr = packet + eth_info.header_len + sizeof(arphdr) + (2 * arp->ar_hln);
+                memcpy(&info.src_ip, arp_ptr, 4);
+                memcpy(&info.dst_ip, arp_ptr + 4 + arp->ar_hln, 4);
+            }
+        }
+    } else if (eth_info.ether_type == ETHERTYPE_IPV6) {
+        if (pkthdr->caplen >= eth_info.header_len + sizeof(ip6_hdr)) {
+            const ip6_hdr* ip6 = reinterpret_cast<const ip6_hdr*>(packet + eth_info.header_len);
+            info.protocol = ip6->ip6_nxt;
+            if (info.protocol == IPPROTO_ICMPV6 && pkthdr->caplen >= eth_info.header_len + sizeof(ip6_hdr) + sizeof(icmp6_hdr)) {
+                const icmp6_hdr* icmp6 = reinterpret_cast<const icmp6_hdr*>(packet + eth_info.header_len + sizeof(ip6_hdr));
+                if (icmp6->icmp6_type == 135 || icmp6->icmp6_type == 136) {
+                    info.protocol = 201; // ND
+                }
+            }
+        }
+    } else if (eth_info.ether_type <= 1500) {
+        if (eth_info.header->ether_dhost[0] == 0x01 && eth_info.header->ether_dhost[1] == 0x80 && 
+            eth_info.header->ether_dhost[2] == 0xC2 && eth_info.header->ether_dhost[3] == 0x00 &&
+            eth_info.header->ether_dhost[4] == 0x00 && eth_info.header->ether_dhost[5] == 0x00) {
+            info.protocol = 202; // STP
+        }
+    } else {
+        return;
     }
+
+    uint32_t capture_len = (pkthdr->caplen < MAX_PAYLOAD_SIZE) ? pkthdr->caplen : MAX_PAYLOAD_SIZE;
+    info.payload_len = (uint16_t)capture_len;
+    memcpy(info.payload, packet, capture_len);
 
     send_packet_info(ssl, info);
 }
@@ -352,6 +393,7 @@ int main(int argc, char* argv[]) {
 
     printf("Listening on %s\n", d->name);
     std::unique_ptr<pcap_t, PcapDeleter> handle(pcap_open_live(d->name, BUFSIZ, 1, 1000, errbuf));
+    global_pcap_handle = handle.get();
     if (handle == nullptr) {
         fprintf(stderr, "Couldn't open device %s: %s\n", d->name, errbuf);
         return 2;

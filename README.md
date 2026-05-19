@@ -18,29 +18,35 @@ A high-performance, multi-language packet analysis system built with C++, Rust, 
 
 1. **C++ Packet Capture** (`cpp/packet_capture.cpp`)
    - Uses libpcap to capture live network packets
-   - Parses Ethernet, IP, TCP/UDP/ICMP headers
+   - Parses Ethernet (including VLAN), IP (IPv4/IPv6), TCP/UDP/ICMP, ARP, ND, OSPF, STP headers
    - Sends packet metadata and payload to Rust service via TCP
    - Optimized for minimal processing overhead
 
 2. **Rust Packet Service** (`rust/packet_service/`)
    - Receives raw packet data from C++ component
+   - Identifies higher-level protocols like DHCP and HTTP based on ports
    - Converts to structured format (JSON)
    - Broadcasts to connected Go dashboard clients
    - Built with Tokio for async I/O and high concurrency
 
 3. **Go Dashboard** (`go/`)
    - Web server serving real-time dashboard
-   - Uses Server-Sent Events (SSE) for live updates
-   - Interactive filtering and statistics
-   - Responsive UI with modern styling
+   - Uses WebSockets for live updates
+   - Advanced interactive filtering with CIDR, regex, and negative matching, and custom autocomplete
+   - Deep packet inspection with interactive hex view (layer highlighting, "Copy as C Array")
+   - Displays MAC vendor names for ARP/STP packets
+   - Adjustable UI panes for custom layouts
+   - Responsive UI with modern styling and light/dark mode
 
 ## Features
 
 - **Real-time Processing**: Sub-millisecond latency from packet capture to display
-- **Multi-protocol Support**: TCP, UDP, ICMP, and other IP protocols
-- **Deep Packet Inspection**: View headers and payload data
-- **Interactive Filtering**: Filter by protocol, IP addresses, ports
+- **Multi-protocol Support**: TCP, UDP, ICMP, ARP, ND, DNS, OSPF, STP, DHCP, HTTP, and other IP protocols
+- **Deep Packet Inspection**: View full Ethernet frames, headers, and payload data with interactive hex view (layer highlighting, "Copy as C Array" context menu)
+- **Interactive Filtering**: Filter by protocol, IP addresses (including CIDR), ports, regex patterns, and negative matches (`-tcp`) with syntax highlighting and custom autocomplete
 - **Live Statistics**: Real-time packet counters
+- **MAC Vendor Lookup**: Displays vendor names for MAC addresses in ARP and STP packets
+- **Adjustable UI**: Resizable panes for packet list, detail view, and hex dump
 - **Cross-platform**: Works on Linux and macOS (with libpcap)
 - **Secure**: No external dependencies beyond standard libraries
 
@@ -99,6 +105,8 @@ Access the dashboard at: http://localhost:8080
 - **Interface Selection**: Currently uses the first available network interface. Modify `packet_capture.cpp` to specify a particular interface.
 - **Performance**: Designed for high-speed packet processing. Adjust buffer sizes in the source code for your specific network environment.
 - **Payload Limitation**: For performance, only the first 128 bytes of each packet payload are transmitted and displayed.
+- **Full Frame Capture**: The C++ component now captures up to 256 bytes of the full Ethernet frame, including L2, L3, and L4 headers, for detailed inspection.
+- **VLAN Support**: The C++ parser correctly handles 802.1Q VLAN tagged frames, adjusting offsets for accurate L3/L4 parsing.
 
 ## Customization
 
