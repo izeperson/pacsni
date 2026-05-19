@@ -1,7 +1,7 @@
 cpp/bin
-go/bin
 rust/bin
 rust/packet_service/target
+go/bin/dashboard
 server.crt
 server.key
 rust/packet_service/Cargo.lock
