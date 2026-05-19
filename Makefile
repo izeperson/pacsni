@@ -36,6 +36,7 @@ run: all certs
 	@rust/bin/packet_service & RUST_PID=$$!; \
 	go/bin/dashboard & GO_PID=$$!; \
 	echo "Dashboard initialized at http://localhost:8080"; \
+	cp go/dashboard/GeoLite2-City.mmdb go/bin/ 2>/dev/null || true; \
 	echo "3. Starting C++ packet capture..."; \
 	sudo -E cpp/bin/packet_capture || ./cpp/bin/packet_capture; \
 	echo "Cleaning up..."; \

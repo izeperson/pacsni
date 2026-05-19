@@ -46,6 +46,7 @@ A high-performance, multi-language packet analysis system built with C++, Rust, 
 - **Interactive Filtering**: Filter by protocol, IP addresses (including CIDR), ports, regex patterns, and negative matches (`-tcp`) with syntax highlighting and custom autocomplete
 - **Live Statistics**: Real-time packet counters
 - **MAC Vendor Lookup**: Displays vendor names for MAC addresses in ARP and STP packets
+- **GeoIP Lookup**: Displays country, city, and ISP information using a local GeoLite2-City database.
 - **Adjustable UI**: Resizable panes for packet list, detail view, and hex dump
 - **Cross-platform**: Works on Linux and macOS (with libpcap)
 - **Secure**: No external dependencies beyond standard libraries
@@ -105,6 +106,7 @@ Access the dashboard at: http://localhost:8080
 - **Interface Selection**: Currently uses the first available network interface. Modify `packet_capture.cpp` to specify a particular interface.
 - **Performance**: Designed for high-speed packet processing. Adjust buffer sizes in the source code for your specific network environment.
 - **Payload Limitation**: For performance, only the first 128 bytes of each packet payload are transmitted and displayed.
+- **Payload Limitation**: For performance, only the first 256 bytes of each packet payload are transmitted and displayed.
 - **Full Frame Capture**: The C++ component now captures up to 256 bytes of the full Ethernet frame, including L2, L3, and L4 headers, for detailed inspection.
 - **VLAN Support**: The C++ parser correctly handles 802.1Q VLAN tagged frames, adjusting offsets for accurate L3/L4 parsing.
 

@@ -257,7 +257,7 @@ function selectPacket(idx) {
             Source: ${pkt.src_mac || 'ff:ff:ff:ff:ff:ff'}${pkt.src_mac_vendor ? ` (${pkt.src_mac_vendor})` : ''} ->
             Destination: ${pkt.dst_mac || '00:00:00:00:00:00'}${pkt.dst_mac_vendor ? ` (${pkt.dst_mac_vendor})` : ''}
         </div>
-        <div class="detail-item" data-layer="l3" onmouseover="highlightHexRange(${l3}, ${l4}, true)" onmouseout="highlightHexRange(${l3}, ${l4}, false)"><b>Layer 3 (Internet)</b>Source IP: ${pkt.src_ip} -> Destination IP: ${pkt.dst_ip} [${pkt.country || 'Local'}]</div>
+        <div class="detail-item" data-layer="l3" onmouseover="highlightHexRange(${l3}, ${l4}, true)" onmouseout="highlightHexRange(${l3}, ${l4}, false)"><b>Layer 3 (Internet)</b>Source IP: ${pkt.src_ip} -> Destination IP: ${pkt.dst_ip} [${pkt.city || 'local city'}, ${pkt.country || 'local country'}${pkt.country_code ? ` - ${pkt.country_code}` : ''}] ${pkt.isp ? `(${pkt.isp})` : ''}</div>
         <div class="detail-item" data-layer="l4" onmouseover="highlightHexRange(${l4}, -1, true)" onmouseout="highlightHexRange(${l4}, -1, false)"><b>Layer 4 (${pkt.protocol})</b>Port: ${pkt.src_port} -> Port: ${pkt.dst_port}${pkt.has_tcp_ao ? ' <span class="badge-ao" title="TCP Authentication Option (RFC 5925)" style="cursor:help; margin-left:10px;" onclick="alert(\'RFC 5925 (TCP-AO): Provides authentication for TCP segments, protecting against spoofing and connection hijacking by signing segments with shared secrets.\')">AO</span>' : ''}</div>
     `;
     document.getElementById('pane-hex').innerHTML = formatHex(pkt.payload);
@@ -345,7 +345,10 @@ function displayData(data = {}) {
                 (p.src_mac_vendor && p.src_mac_vendor.toLowerCase().includes(check)) ||
                 (p.dst_mac_vendor && p.dst_mac_vendor.toLowerCase().includes(check)) ||
                 p.info.toLowerCase().includes(check) ||
-                (p.country && p.country.toLowerCase().includes(check));
+                (p.country && p.country.toLowerCase().includes(check)) ||
+                (p.country_code && p.country_code.toLowerCase().includes(check)) ||
+                (p.city && p.city.toLowerCase().includes(check)) ||
+                (p.isp && p.isp.toLowerCase().includes(check));
             
             if (!found && check.includes('/')) {
                 found = ipInCIDR(p.src_ip, check) || ipInCIDR(p.dst_ip, check);
@@ -419,6 +422,11 @@ function startWebSocket() {
             packets.forEach(p => {
                 if (p.src_ip === msg.ip || p.dst_ip === msg.ip) {
                     p.country = msg.country;
+                    p.city = msg.city;
+                    p.isp = msg.isp;
+                    p.country_code = msg.code;
+                    if (!knownIPs.has(msg.country)) knownIPs.add(msg.country);
+                    if (!knownIPs.has(msg.code)) knownIPs.add(msg.code);
                 }
             });
             needsUpdate = true;

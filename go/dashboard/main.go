@@ -11,64 +11,116 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/oschwald/geoip2-golang"
+
 	"github.com/gorilla/websocket"
 )
 
 type DashboardPacket struct {
-	Timestamp    uint64 `json:"timestamp"`
-	SrcIP        string `json:"src_ip"`
-	DstIP        string `json:"dst_ip"`
-	SrcPort      uint16 `json:"src_port"`
-	DstPort      uint16 `json:"dst_port"`
-	SrcMAC       string `json:"src_mac"`
-	DstMAC       string `json:"dst_mac"`
-	Protocol     string `json:"protocol"`
-	HasTcpAo     bool   `json:"has_tcp_ao"`
-	TcpFlags     uint8  `json:"tcp_flags"`
-	L3Offset     uint8  `json:"l3_offset"`
-	L4Offset     uint8  `json:"l4_offset"`
-	Payload      []byte `json:"payload"`
-	Index        int    `json:"index"`
-	Info         string `json:"info"`
-	SrcMacVendor string `json:"src_mac_vendor"`
-	DstMacVendor string `json:"dst_mac_vendor"`
-	Country      string `json:"country"`
+	Timestamp    uint64   `json:"timestamp"`
+	SrcIP        string   `json:"src_ip"`
+	DstIP        string   `json:"dst_ip"`
+	SrcPort      uint16   `json:"src_port"`
+	DstPort      uint16   `json:"dst_port"`
+	SrcMAC       string   `json:"src_mac"`
+	DstMAC       string   `json:"dst_mac"`
+	Protocol     string   `json:"protocol"`
+	HasTcpAo     bool     `json:"has_tcp_ao"`
+	TcpFlags     uint8    `json:"tcp_flags"`
+	L3Offset     uint8    `json:"l3_offset"`
+	L4Offset     uint8    `json:"l4_offset"`
+	TcpSeq       uint32   `json:"tcp_seq"`
+	TcpAck       uint32   `json:"tcp_ack"`
+	VlanID       uint16   `json:"vlan_id"`
+	IpTTL        uint8    `json:"ip_ttl"`
+	IpTos        uint8    `json:"ip_tos"`
+	TcpWin       uint16   `json:"tcp_win"`
+	IpID         uint16   `json:"ip_id"`
+	IsIpv6       bool     `json:"is_ipv6"`
+	IsFragment   bool     `json:"is_fragment"`
+	TcpMSS       uint16   `json:"tcp_mss"`
+	TcpWS        uint8    `json:"tcp_ws"`
+	Ipv6ExtCount uint8    `json:"ipv6_ext_count"`
+	Ipv6Flow     uint32   `json:"ipv6_flow"`
+	WireLen      uint32   `json:"wire_len"`
+	TcpTsVal     uint32   `json:"tcp_ts_val"`
+	TcpTsEcr     uint32   `json:"tcp_ts_ecr"`
+	TcpSack      bool     `json:"tcp_sack"`
+	TcpRTT       uint32   `json:"tcp_rtt"`
+	VxlanVNI     uint32   `json:"vxlan_vni"`
+	Entropy      uint32   `json:"entropy_scaled"`
+	NtpStratum   uint8    `json:"ntp_stratum"`
+	NtpMode      uint8    `json:"ntp_mode"`
+	IgmpGroup    string   `json:"igmp_group"`
+	IgmpType     uint8    `json:"igmp_type"`
+	LldpChassis  string   `json:"lldp_chassis"`
+	LldpPort     string   `json:"lldp_port"`
+	TcpSackEdges []uint32 `json:"tcp_sack_edges"`
+	TopByteInfo  string   `json:"top_byte_info"`
+	DnsQuery     string   `json:"dns_query"`
+	TlsSNI       string   `json:"tls_sni"`
+	ExtraInfo    string   `json:"extra_info"`
+	Payload      []byte   `json:"payload"`
+	Index        int      `json:"index"`
+	Info         string   `json:"info"`
+	SrcMacVendor string   `json:"src_mac_vendor"`
+	DstMacVendor string   `json:"dst_mac_vendor"`
+	Country      string   `json:"country"`
+	City         string   `json:"city"`
+	ISP          string   `json:"isp"`
+	CountryCode  string   `json:"country_code"`
 }
 
 func getPacketInfo(pkt *DashboardPacket) string {
-	if pkt.SrcPort == 53 || pkt.DstPort == 53 {
-		return fmt.Sprintf("DNS Message %d -> %d", pkt.SrcPort, pkt.DstPort)
+	if pkt.TlsSNI != "" {
+		return fmt.Sprintf("TLS SNI: %s (%d -> %d)", pkt.TlsSNI, pkt.SrcPort, pkt.DstPort)
+	}
+	if pkt.ExtraInfo != "" {
+		return pkt.ExtraInfo
+	}
+	if pkt.DnsQuery != "" {
+		return fmt.Sprintf("DNS Query: %s", pkt.DnsQuery)
 	}
 
 	switch pkt.Protocol {
 	case "TCP":
 		var flags []string
-		if pkt.TcpFlags&0x02 != 0 { // SYN
+		info := fmt.Sprintf("%d -> %d", pkt.SrcPort, pkt.DstPort)
+		if pkt.VlanID > 0 {
+			info += fmt.Sprintf(" [VLAN %d]", pkt.VlanID)
+		}
+		if pkt.TcpFlags&0x02 != 0 {
 			flags = append(flags, "<span style='color:#fbbf24; font-weight:800;'>SYN</span>")
 		}
-		if pkt.TcpFlags&0x01 != 0 { // FIN
+		if pkt.TcpFlags&0x01 != 0 {
 			flags = append(flags, "<span style='color:#a855f7; font-weight:800;'>FIN</span>")
 		}
-		if pkt.TcpFlags&0x04 != 0 { // RST
+		if pkt.TcpFlags&0x04 != 0 {
 			flags = append(flags, "<span style='color:#f43f5e; font-weight:800;'>RST</span>")
 		}
-		if pkt.TcpFlags&0x10 != 0 { // ACK
+
+		info = fmt.Sprintf("%d -> %d", pkt.SrcPort, pkt.DstPort)
+		if pkt.Entropy > 7200 {
+			info += " <span title='High Entropy (Possible Encryption)' style='color:#ec4899; cursor:help;'>[!]</span>"
+		}
+
+		if pkt.TcpFlags&0x10 != 0 {
 			flags = append(flags, "ACK")
 		}
-		if pkt.TcpFlags&0x08 != 0 { // PSH
+		if pkt.TcpFlags&0x08 != 0 {
 			flags = append(flags, "PSH")
 		}
 
-		info := fmt.Sprintf("%d -> %d", pkt.SrcPort, pkt.DstPort)
 		if len(flags) > 0 {
 			info += " [" + strings.Join(flags, ",") + "]"
 		}
-		return fmt.Sprintf("%s seq=0 ack=0 win=64240 len=%d", info, len(pkt.Payload))
+		return fmt.Sprintf("%s seq=%d ack=%d win=%d len=%d", info, pkt.TcpSeq, pkt.TcpAck, pkt.TcpWin, len(pkt.Payload))
 	case "UDP":
 		return fmt.Sprintf("%d -> %d len=%d", pkt.SrcPort, pkt.DstPort, len(pkt.Payload))
 	case "DHCP":
@@ -98,7 +150,11 @@ func getPacketInfo(pkt *DashboardPacket) string {
 		if pkt.DstMacVendor != "" {
 			dstVendor = fmt.Sprintf(" (%s)", pkt.DstMacVendor)
 		}
-		return fmt.Sprintf("Spanning Tree Protocol Message to %s%s", pkt.DstMAC, dstVendor)
+		cityISP := ""
+		if pkt.City != "" || pkt.ISP != "" {
+			cityISP = fmt.Sprintf(" (%s, %s)", pkt.City, pkt.ISP)
+		}
+		return fmt.Sprintf("Spanning Tree Protocol Message to %s%s%s", pkt.DstMAC, dstVendor, cityISP)
 	default:
 		return fmt.Sprintf("protocol %s message", strings.ToLower(pkt.Protocol))
 	}
@@ -156,6 +212,14 @@ func (r *RingBuffer[T]) GetAll(reversed bool) []T {
 	return res
 }
 
+func (r *RingBuffer[T]) Update(updater func(*T)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for i := 0; i < r.count; i++ {
+		updater(&r.data[i])
+	}
+}
+
 //go:embed index.html script.js
 var content embed.FS
 
@@ -167,7 +231,8 @@ var (
 	packetCounter = 0
 	seenIPs       = make(map[string]bool)
 	geoCache      = NewLRUCache(10000)
-	mu            sync.Mutex
+	mu            sync.Mutex // Protects isScanning, filterStr, filterRegex, packetCounter, seenIPs, geoDB
+	geoDB         *geoip2.Reader
 	geoReqChan    = make(chan string, 1000)
 )
 
@@ -334,40 +399,48 @@ func getMacVendor(mac string) string {
 }
 
 func geoWorker() {
-	ticker := time.NewTicker(1500 * time.Millisecond)
-	defer ticker.Stop()
-	client := &http.Client{Timeout: 5 * time.Second}
 	for ip := range geoReqChan {
-		<-ticker.C
-		resp, err := client.Get(fmt.Sprintf("http://ip-api.com/json/%s?fields=country", ip))
+		if geoDB == nil {
+			continue
+		}
+
+		parsedIP := net.ParseIP(ip)
+		record, err := geoDB.City(parsedIP)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[GEO ERROR] Request failed for %s: %v\n", ip, err)
-			continue
-		}
-		if resp.StatusCode == http.StatusTooManyRequests {
-			fmt.Fprintf(os.Stderr, "[GEO ERROR] Rate limit hit for %s. Sleeping 1m...\n", ip)
-			resp.Body.Close()
-			time.Sleep(1 * time.Minute)
-			continue
-		}
-		var res struct {
-			Country string `json:"country"`
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&res); err == nil && res.Country != "" {
-			geoCache.Add(ip, strings.ToLower(res.Country))
-			saveGeoCacheToDisk()
-			broadcast(map[string]interface{}{
-				"type":    "geo_update",
-				"ip":      ip,
-				"country": strings.ToLower(res.Country),
-			})
-		} else {
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "[GEO ERROR] Failed to decode response for %s: %v\n", ip, err)
-			}
 			geoCache.Remove(ip)
+			continue
 		}
-		resp.Body.Close()
+
+		country := strings.ToLower(record.Country.Names["en"])
+		code := strings.ToLower(record.Country.IsoCode)
+		city := strings.ToLower(record.City.Names["en"])
+		isp := "" // GeoLite2-City does not contain ISP info.
+
+		if country == "" {
+			country = "unknown"
+		}
+
+		geoCache.Add(ip, fmt.Sprintf("%s|%s|%s|%s", country, code, city, isp))
+		saveGeoCacheToDisk()
+
+		historyBuffer.Update(func(p *DashboardPacket) {
+			if p.SrcIP == ip || p.DstIP == ip {
+				p.Country = country
+				p.CountryCode = code
+				p.City = city
+				p.ISP = isp
+			}
+		})
+
+		broadcast(map[string]interface{}{
+			"type":    "geo_update",
+			"ip":      ip,
+			"country": country,
+			"city":    city,
+			"isp":     isp,
+			"code":    code,
+		})
 	}
 }
 
@@ -426,6 +499,21 @@ func main() {
 	rustServiceAddr := net.JoinHostPort(rustServiceHost, rustServicePort)
 
 	loadGeoCache()
+
+	var err error
+
+	exePath, err := os.Executable()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[WARN] Could not determine executable path: %v. Geo lookups disabled.\n", err)
+	}
+	exeDir := filepath.Dir(exePath)
+	dbPath := filepath.Join(exeDir, "GeoLite2-City.mmdb")
+	geoDB, err = geoip2.Open(dbPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[WARN] Could not open GeoLite2-City.mmdb: %v. Geo lookups disabled.\n", err)
+	} else {
+		defer geoDB.Close()
+	}
 
 	go geoWorker()
 
@@ -494,16 +582,25 @@ func main() {
 			seenIPs[pkt.SrcIP] = true
 			seenIPs[pkt.DstIP] = true
 
+			pkt.SrcMacVendor = getMacVendor(pkt.SrcMAC)
+			pkt.DstMacVendor = getMacVendor(pkt.DstMAC)
+
 			if !isPrivateIP(pkt.SrcIP) {
-				pkt.Country = getCountry(pkt.SrcIP)
+				res := getCountry(pkt.SrcIP)
+				parts := strings.Split(res, "|")
+				pkt.Country = parts[0]
+				if len(parts) > 1 {
+					pkt.CountryCode = parts[1]
+				}
 			} else if !isPrivateIP(pkt.DstIP) {
-				pkt.Country = getCountry(pkt.DstIP)
+				res := getCountry(pkt.DstIP)
+				parts := strings.Split(res, "|")
+				pkt.Country = parts[0]
+				if len(parts) > 1 {
+					pkt.CountryCode = parts[1]
+				}
 			} else {
 				pkt.Country = "local"
-			}
-			if pkt.Protocol == "ARP" || pkt.Protocol == "STP" { // Only lookup for protocols where MAC vendor is relevant
-				pkt.SrcMacVendor = getMacVendor(pkt.SrcMAC)
-				pkt.DstMacVendor = getMacVendor(pkt.DstMAC)
 			}
 
 			match := false
@@ -520,7 +617,8 @@ func main() {
 					filterRegex.MatchString(pkt.SrcIP) ||
 					filterRegex.MatchString(pkt.DstIP) ||
 					filterRegex.MatchString(pkt.Info) ||
-					filterRegex.MatchString(pkt.Country)
+					filterRegex.MatchString(pkt.Country) ||
+					filterRegex.MatchString(pkt.CountryCode)
 			} else {
 				match = true
 				parts := strings.Fields(strings.ToLower(filterStr))
@@ -529,6 +627,7 @@ func main() {
 				lowDst := strings.ToLower(pkt.DstIP)
 				lowInfo := strings.ToLower(pkt.Info)
 				lowCountry := strings.ToLower(pkt.Country)
+				lowCode := strings.ToLower(pkt.CountryCode)
 
 				for _, part := range parts {
 					negate := strings.HasPrefix(part, "-")
@@ -541,6 +640,7 @@ func main() {
 						strings.Contains(lowDst, checkPart) ||
 						strings.Contains(lowInfo, checkPart) ||
 						strings.Contains(lowCountry, checkPart) ||
+						strings.Contains(lowCode, checkPart) ||
 						((checkPart == "tcp-ao" || checkPart == "ao") && pkt.HasTcpAo)
 					if negate {
 						partMatch = !partMatch

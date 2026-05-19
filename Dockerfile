@@ -23,6 +23,7 @@ FROM golang:latest AS go_builder
 WORKDIR /app/go/dashboard
 COPY go/dashboard/main.go .
 COPY go/dashboard/index.html .
+COPY go/dashboard/script.js .
 RUN go mod init dashboard || true
 RUN go mod tidy
 RUN go build -o dashboard .
@@ -42,6 +43,7 @@ COPY --from=rust_builder /app/rust/packet_service/target/release/packet_service 
 COPY --from=rust_builder /app/rust/packet_service/server.crt /app/rust/server.crt
 COPY --from=rust_builder /app/rust/packet_service/server.key /app/rust/server.key
 
-COPY --from=go_builder /app/go/dashboard/dashboard /app/go/dashboard/dashboard
+COPY --from=go_builder /app/go/dashboard/dashboard /app/go/dashboard/dashboard 
+COPY go/dashboard/GeoLite2-City.mmdb /app/GeoLite2-City.mmdb
 
 EXPOSE 8080
