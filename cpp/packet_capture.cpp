@@ -33,6 +33,7 @@ struct __attribute__((__packed__)) PacketInfo {
     uint16_t src_port;
     uint16_t dst_port;
     uint8_t  protocol;
+    uint8_t  has_tcp_ao;
     uint16_t payload_len;
     uint8_t  src_mac[6];
     uint8_t  dst_mac[6];
@@ -91,8 +92,12 @@ void send_packet_info(SSL* ssl, const PacketInfo& info) {
     unsigned char hmac_result[EVP_MAX_MD_SIZE];
     size_t hash_len = 0;
 
+    // Restored modern OpenSSL 3.0+ EVP_MAC API
     std::unique_ptr<EVP_MAC, EvpMacDeleter> mac(EVP_MAC_fetch(NULL, "HMAC", NULL));
-    if (!mac) return;
+    if (!mac) {
+        log_ssl_error("EVP_MAC_fetch failed. Ensure OpenSSL 3.0+ is installed.");
+        return;
+    }
 
     std::unique_ptr<EVP_MAC_CTX, EvpMacCtxDeleter> hmac_ctx(EVP_MAC_CTX_new(mac.get()));
     if (!hmac_ctx) {
@@ -104,14 +109,17 @@ void send_packet_info(SSL* ssl, const PacketInfo& info) {
     params[1] = OSSL_PARAM_construct_end();
 
     if (EVP_MAC_init(hmac_ctx.get(), (const unsigned char*)SHARED_SECRET, strlen(SHARED_SECRET), params) != 1) {
+        log_ssl_error("EVP_MAC_init failed");
         return;
     }
 
     if (EVP_MAC_update(hmac_ctx.get(), reinterpret_cast<const unsigned char*>(&info), sizeof(PacketInfo)) != 1) {
+        log_ssl_error("EVP_MAC_update failed");
         return;
     }
 
     if (EVP_MAC_final(hmac_ctx.get(), hmac_result, &hash_len, sizeof(hmac_result)) != 1) {
+        log_ssl_error("EVP_MAC_final failed");
         return;
     }
 
@@ -223,6 +231,22 @@ void packet_handler(u_char* user_data, const struct pcap_pkthdr* pkthdr, const u
     if (!transport_info_opt) return;
     TransportInfo transport_info = *transport_info_opt;
 
+    // Restored functionality: Detect TCP Authentication Option (TCP-AO, Option 29)
+    bool tcp_ao_info_opt = false;
+    if (ip_info.protocol == IPPROTO_TCP) {
+        const tcphdr* tcp = reinterpret_cast<const tcphdr*>(packet + eth_info.header_len + ip_info.header_len);
+        const u_char* options = (const u_char*)(tcp + 1);
+        int opt_len = (tcp->th_off * 4) - sizeof(tcphdr);
+        for (int i = 0; i < opt_len; ) {
+            if (options[i] == 0) break; // End of list
+            if (options[i] == 1) { i++; continue; } // NOP
+            if (options[i] == 29) { tcp_ao_info_opt = true; break; }
+            uint8_t len = (i + 1 < opt_len) ? options[i+1] : 1;
+            if (len < 2) len = 2; // Sanity check
+            i += len;
+        }
+    }
+
     PacketInfo info;
     memset(&info, 0, sizeof(info));
 
@@ -235,9 +259,10 @@ void packet_handler(u_char* user_data, const struct pcap_pkthdr* pkthdr, const u
     info.src_port = transport_info.src_port;
     info.dst_port = transport_info.dst_port;
     info.protocol = ip_info.protocol;
+    info.has_tcp_ao = tcp_ao_info_opt ? 1 : 0;
     info.payload_len = (transport_info.payload_len < 0) ? 0 : (uint16_t)transport_info.payload_len;
-    memcpy(info.src_mac, eth_header->ether_shost, 6);
-    memcpy(info.dst_mac, eth_header->ether_dhost, 6);
+    memcpy(info.src_mac, eth_info.header->ether_shost, 6);
+    memcpy(info.dst_mac, eth_info.header->ether_dhost, 6);
 
     if (transport_info.payload_len > 0 && transport_info.payload_ptr != nullptr) {
         uint32_t captured_payload_len = pkthdr->caplen - (uint32_t)(transport_info.payload_ptr - packet);
@@ -355,7 +380,7 @@ int main(int argc, char* argv[]) {
         struct sockaddr_in serv_addr;
         std::memset(&serv_addr, 0, sizeof(serv_addr));
         serv_addr.sin_family = AF_INET;
-        serv_addr.sin_port = htons(DEST_PORT);
+        serv_addr.sin_port = htons(dest_port);
         if (inet_pton(AF_INET, dest_ip, &serv_addr.sin_addr) <= 0) {
             fprintf(stderr, "Invalid address: %s\n", dest_ip);
             close(sockfd);

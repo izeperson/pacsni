@@ -9,14 +9,13 @@ use tokio_rustls::rustls::{self, pki_types::{CertificateDer, PrivateKeyDer}};
 use tokio_rustls::TlsAcceptor;
 use ring::hmac;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use sha2::{Sha512};
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::fs::File;
 use std::io::BufReader;
 
 const SHARED_SECRET: &[u8] = b"pacsni_secure_shared_secret_123";
-const STRUCT_SIZE: usize = 163;
+const STRUCT_SIZE: usize = 164;
 const HASH_SIZE: usize = 64;
 const TOTAL_MSG_SIZE: usize = STRUCT_SIZE + HASH_SIZE;
 
@@ -28,6 +27,7 @@ struct DashboardPacket {
     src_port: u16,
     dst_port: u16,
     protocol: String,
+    has_tcp_ao: bool,
     payload: Vec<u8>,
     src_mac: String,
     dst_mac: String,
@@ -206,6 +206,7 @@ async fn handle_cpp_connection<S: io::AsyncRead + io::AsyncWrite + Unpin>(mut so
             let src_port = buffer.get_u16_le();
             let dst_port = buffer.get_u16_le();
             let protocol = buffer.get_u8();
+            let has_tcp_ao = buffer.get_u8() != 0;
             let payload_len = buffer.get_u16_le();
             
             let mut src_mac_raw = [0u8; 6];
@@ -228,6 +229,7 @@ async fn handle_cpp_connection<S: io::AsyncRead + io::AsyncWrite + Unpin>(mut so
                 src_port,
                 dst_port,
                 protocol: protocol_to_string(protocol),
+                has_tcp_ao,
                 payload: valid_payload.to_vec(),
                 src_mac: mac_addr_to_string(&src_mac_raw),
                 dst_mac: mac_addr_to_string(&dst_mac_raw),

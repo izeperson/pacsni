@@ -25,6 +25,7 @@ type DashboardPacket struct {
 	SrcPort   uint16 `json:"src_port"`
 	DstPort   uint16 `json:"dst_port"`
 	Protocol  string `json:"protocol"`
+	HasTcpAo  bool   `json:"has_tcp_ao"`
 	Payload   []byte `json:"payload"`
 	Index     int    `json:"index"`
 	Info      string `json:"info"`
@@ -32,9 +33,13 @@ type DashboardPacket struct {
 }
 
 func getPacketInfo(pkt *DashboardPacket) string {
+	aoSuffix := ""
+	if pkt.HasTcpAo {
+		aoSuffix = " [TCP-AO]"
+	}
 	switch pkt.Protocol {
 	case "TCP":
-		return fmt.Sprintf("%d -> %d [ack] seq=0 ack=0 win=64240 len=%d", pkt.SrcPort, pkt.DstPort, len(pkt.Payload))
+		return fmt.Sprintf("%d -> %d [ack] seq=0 ack=0 win=64240 len=%d%s", pkt.SrcPort, pkt.DstPort, len(pkt.Payload), aoSuffix)
 	case "UDP":
 		return fmt.Sprintf("%d -> %d len=%d", pkt.SrcPort, pkt.DstPort, len(pkt.Payload))
 	case "ICMP":

@@ -5,8 +5,8 @@ all: cpp rust go certs
 # Build the C++ packet capture program
 cpp:
 	@echo "Building C++ packet capture..."
-	@mkdir -p cpp/bin
-	@g++ -std=c++11 -Wall -Wextra -lpcap -lssl -lcrypto cpp/packet_capture.cpp -o cpp/bin/packet_capture
+	@mkdir -p cpp/bin 
+	@g++ -std=c++17 -Wall -Wextra -lpcap -lssl -lcrypto cpp/packet_capture.cpp -o cpp/bin/packet_capture
 
 # Build the Rust packet service
 rust:
