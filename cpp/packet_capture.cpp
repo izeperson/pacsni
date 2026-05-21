@@ -17,6 +17,9 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
 #endif
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -32,13 +35,13 @@
 #include <atomic>
 #include <signal.h>
 #include <cmath>
+#include <thread>
 
 // Windows compatibility fixes
 #ifdef _WIN32
 #define sleep(x) Sleep((x)*1000)
 typedef int ssize_t;
 
-// Basic definitions usually found in netinet
 struct ether_header {
     uint8_t  ether_dhost[6];
     uint8_t  ether_shost[6];
@@ -60,7 +63,7 @@ void* memmem(const void* haystack, size_t haystacklen, const void* needle, size_
 #endif
 
 const char* DEST_IP = "127.0.0.1";
-const char* SHARED_SECRET = "pacsni_secure_shared_secret_123";
+static const char* shared_secret = nullptr;
 const int MAX_PAYLOAD_SIZE = 256;
 
 #ifdef _WIN32
@@ -128,6 +131,16 @@ PacketInfo {
 #pragma pack(pop)
 #endif
 
+static_assert(sizeof(PacketInfo) == 1024, "PacketInfo struct must be exactly 1024 bytes for protocol compatibility.");
+
+struct CaptureContext {
+    SSL* ssl;
+    std::queue<PacketInfo> queue;
+    std::mutex mutex;
+    std::condition_variable cv;
+    const size_t max_queue_size = 5000;
+};
+
 // Helper struct for Ethernet layer info
 struct EthernetInfo {
     const ether_header* header;
@@ -164,7 +177,6 @@ struct TransportInfo {
 };
 
 #ifdef _WIN32
-// Mocking some Linux-specific structs used in the parser if not available
 struct ip {
     uint8_t  ip_hl:4, ip_v:4;
     uint8_t  ip_tos;
@@ -458,11 +470,15 @@ void dissect_dns(const u_char* payload, int len, char* out, int out_max) {
         
         pos++;
         for (int i = 0; i < label_len && pos < len - 12 && out_pos < out_max - 1; i++) {
-            out[out_pos++] = data[pos++];
+            out[out_pos++] = (char)data[pos++];
         }
         if (out_pos < out_max - 1) out[out_pos++] = '.';
     }
-    if (out_pos > 0) out[out_pos - 1] = '\0';
+    if (out_pos > 0) {
+        out[out_pos - (out[out_pos-1] == '.' ? 1 : 0)] = '\0';
+    } else {
+        out[0] = '\0';
+    }
 }
 
 void dissect_tls_sni(const u_char* payload, int len, char* out, int out_max) {
@@ -598,7 +614,7 @@ std::optional<TransportInfo> parse_transport_layer(const u_char* packet, uint32_
     TransportInfo t;
     std::memset(&t, 0, sizeof(t));
     int offset = eth_hlen + ip_i.header_len;
-    // Simplified protocol check for cross-platform
+    // simplified protocol check for cross platform
     if (ip_i.protocol == 6) { // TCP
         if (caplen < (uint32_t)(offset + 20)) return std::nullopt;
         // Using offsets instead of tcphdr struct to avoid header conflicts
@@ -630,7 +646,7 @@ void send_packet_info(SSL* ssl, const PacketInfo& info) {
     if (!ssl) return;
     unsigned char hmac_result[EVP_MAX_MD_SIZE];
     unsigned int hash_len = 0;
-    HMAC(EVP_sha512(), SHARED_SECRET, strlen(SHARED_SECRET),
+    HMAC(EVP_sha512(), shared_secret, (shared_secret ? (int)strlen(shared_secret) : 0),
          reinterpret_cast<const unsigned char*>(&info), sizeof(PacketInfo),
          hmac_result, &hash_len);
     uint8_t combined[sizeof(PacketInfo) + 64];
@@ -641,19 +657,39 @@ void send_packet_info(SSL* ssl, const PacketInfo& info) {
     const char* buffer = reinterpret_cast<const char*>(combined);
     ssize_t sent = 0;
     while ((size_t)sent < total_size) {
-        ssize_t n = SSL_write(ssl, buffer + sent, total_size - sent);
+        ssize_t n = SSL_write(ssl, buffer + sent, (int)(total_size - sent));
         if (n <= 0) {
             int ssl_err = SSL_get_error(ssl, n);
-            if (ssl_err == SSL_ERROR_WANT_WRITE || ssl_err == SSL_ERROR_WANT_READ) continue;
+            if (ssl_err == SSL_ERROR_WANT_WRITE || ssl_err == SSL_ERROR_WANT_READ) {
+                std::this_thread::yield(); // Prevent pinning the CPU
+                continue;
+            }
             return;
         }
         sent += n;
     }
 }
 
+void sender_thread_main(CaptureContext* ctx) {
+    while (keep_running || !ctx->queue.empty()) {
+        PacketInfo info;
+        {
+            std::unique_lock<std::mutex> lock(ctx->mutex);
+            ctx->cv.wait(lock, [ctx] { return !ctx->queue.empty() || !keep_running; });
+            if (ctx->queue.empty()) {
+                if (!keep_running) break;
+                continue;
+            }
+            info = ctx->queue.front();
+            ctx->queue.pop();
+        }
+        send_packet_info(ctx->ssl, info);
+    }
+}
+
 void packet_handler(u_char* user_data, const struct pcap_pkthdr* pkthdr, const u_char* packet) {
     if (!user_data || !pkthdr || !packet) return;
-    SSL* ssl = reinterpret_cast<SSL*>(user_data);
+    CaptureContext* ctx = reinterpret_cast<CaptureContext*>(user_data);
     auto eth_info_opt = parse_ethernet_layer(packet, pkthdr->caplen);
     if (!eth_info_opt) return;
     EthernetInfo eth_info = *eth_info_opt;
@@ -703,7 +739,7 @@ void packet_handler(u_char* user_data, const struct pcap_pkthdr* pkthdr, const u
             }
 #endif
             if (info.protocol == IPPROTO_ICMP || info.protocol == IPPROTO_ICMPV6) {
-                if (info.protocol == IPPROTO_ICMP && info.l4_offset + 8 <= pkthdr->caplen) {
+                if (info.protocol == IPPROTO_ICMP && (uint32_t)info.l4_offset + 8 <= pkthdr->caplen) {
                     // Using raw offsets for ICMP 
                     info.icmp_type = packet[info.l4_offset];
                     info.icmp_code = packet[info.l4_offset + 1];
@@ -770,7 +806,14 @@ void packet_handler(u_char* user_data, const struct pcap_pkthdr* pkthdr, const u
     info.entropy_scaled = calculate_entropy_scaled(packet, capture_len);
     calculate_byte_stats(packet, capture_len, info);
     memcpy(info.payload, packet, capture_len);
-    send_packet_info(ssl, info);
+
+    {
+        std::lock_guard<std::mutex> lock(ctx->mutex);
+        if (ctx->queue.size() < ctx->max_queue_size) {
+            ctx->queue.push(info);
+            ctx->cv.notify_one();
+        }
+    }
 }
 
 int main(int argc, char* argv[]) {
@@ -784,6 +827,12 @@ int main(int argc, char* argv[]) {
 
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
+
+    shared_secret = getenv("PACSNI_SHARED_SECRET");
+    if (!shared_secret) {
+        fprintf(stderr, "[WARN] PACSNI_SHARED_SECRET environment variable not set. Using default for development.\n");
+        shared_secret = "pacsni_secure_shared_secret_123";
+    }
 
     const char* dest_ip_env = getenv("RUST_SERVICE_HOST");
     const char* dest_ip = dest_ip_env ? dest_ip_env : "127.0.0.1";
@@ -802,17 +851,17 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::unique_ptr<SSL_CTX, SslCtxDeleter> ctx(SSL_CTX_new(method));
-    if (!ctx) {
+    std::unique_ptr<SSL_CTX, SslCtxDeleter> ssl_ctx(SSL_CTX_new(method));
+    if (!ssl_ctx) {
         log_ssl_error("Unable to create SSL context");
         return 1;
     }
 
-    if (SSL_CTX_set_min_proto_version(ctx.get(), TLS1_3_VERSION) != 1) {
+    if (SSL_CTX_set_min_proto_version(ssl_ctx.get(), TLS1_3_VERSION) != 1) {
         fprintf(stderr, "Error: Failed to set minimum protocol version to TLS 1.3\n");
         return 1;
     }
-    if (SSL_CTX_set_max_proto_version(ctx.get(), TLS1_3_VERSION) != 1) {
+    if (SSL_CTX_set_max_proto_version(ssl_ctx.get(), TLS1_3_VERSION) != 1) {
         fprintf(stderr, "Error: Failed to set maximum protocol version to TLS 1.3\n");
         return 1;
     }
@@ -914,7 +963,7 @@ int main(int argc, char* argv[]) {
 
         std::cout << "[INFO] Connecting to Rust service at " << dest_ip << ":" << dest_port << "...\n" << std::flush;
         if (connect(sockfd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) == 0) {
-            ssl.reset(SSL_new(ctx.get()));
+            ssl.reset(SSL_new(ssl_ctx.get()));
             if (!ssl) {
                 log_ssl_error("SSL_new failed");
                 continue;
@@ -938,11 +987,19 @@ int main(int argc, char* argv[]) {
         ::sleep(2);
     }
 
+    CaptureContext ctx;
+    std::thread sender_thread;
     if (keep_running && handle && ssl) {
-        if (pcap_loop(handle.get(), -1, packet_handler, reinterpret_cast<u_char*>(ssl.get())) < 0) {
+        ctx.ssl = ssl.get();
+        sender_thread = std::thread(sender_thread_main, &ctx);
+        if (pcap_loop(handle.get(), -1, packet_handler, reinterpret_cast<u_char*>(&ctx)) < 0) {
             fprintf(stderr, "pcap_loop error: %s\n", pcap_geterr(handle.get()));
         }
     }
+
+    keep_running = false;
+    ctx.cv.notify_all();
+    if (sender_thread.joinable()) sender_thread.join();
 
     if (sockfd != -1) close(sockfd);
     printf("[INFO] Shutting down gracefully.\n");
