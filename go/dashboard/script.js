@@ -7,6 +7,9 @@ const VISIBLE_BUFFER = 5;
 const SUGGESTIONS = ['tcp', 'udp', 'icmp', 'arp', 'nd', 'dns', 'ospf', 'stp', 'dhcp', 'http', 'tcp-ao', 'ao', 'regex:', 'stream:'];
 let knownIPs = new Set();
 let activeSuggestionIdx = -1;
+let lastRenderTime = 0;
+const RENDER_THROTTLE_MS = 100; // Render max 10 times per second
+let packetBuffer = [];
 
 if (selectedIdx === -1) document.getElementById('pane-detail').innerHTML = '<div style="color:var(--muted); font-size:12px;">Select a packet for deep inspection</div>';
 const resizer = document.getElementById('resizer');
@@ -311,13 +314,6 @@ document.getElementById('pane-hex').addEventListener('contextmenu', (e) => {
 function displayData(data = {}) {
     if (data.packets) {
         packets = data.packets;
-        packets.forEach(p => {
-            if (p.decodedLength === undefined) {
-                try {
-                    p.decodedLength = p.payload ? atob(p.payload).length : 0;
-                } catch(e) { p.decodedLength = 0; }
-            }
-        });
     }
     
     if (data.ips) {
@@ -364,12 +360,14 @@ function displayData(data = {}) {
     const containerHeight = paneList.clientHeight;
     
     const startIdx = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - VISIBLE_BUFFER);
-    const endIdx = Math.min(filteredPackets.length, Math.ceil((scrollTop + containerHeight) / ROW_HEIGHT) + VISIBLE_BUFFER);
+    const endIdx = Math.ceil((scrollTop + containerHeight) / ROW_HEIGHT) + VISIBLE_BUFFER;
 
-    const visiblePackets = filteredPackets.slice(startIdx, endIdx);
+    // Show newest first by slicing from the end of the filtered list
+    const reversedFiltered = [...filteredPackets].reverse();
+    const visiblePackets = reversedFiltered.slice(startIdx, endIdx);
     
     const paddingTop = startIdx * ROW_HEIGHT;
-    const paddingBottom = (filteredPackets.length - endIdx) * ROW_HEIGHT;
+    const paddingBottom = Math.max(0, (filteredPackets.length - endIdx) * ROW_HEIGHT);
 
     const rowsHtml = visiblePackets.map(pkt => 
         '<tr id="pkt-' + pkt.index + '" onclick="selectPacket(' + pkt.index + ')" oncontextmenu="showContextMenu(event, ' + pkt.index + ')" class="' + (pkt.index === selectedIdx ? 'selected' : '') + (pkt.decodedLength === 0 ? ' empty-packet' : '') + '">' +
@@ -411,12 +409,16 @@ function startWebSocket() {
     ws.onmessage = (event) => {
         const msg = JSON.parse(event.data);
         if (msg.type === 'packet') {
+            const p = msg.packet;
+            // Pre-calculate expensive values once
             try {
-                msg.packet.decodedLength = msg.packet.payload ? atob(msg.packet.payload).length : 0;
-            } catch(e) { msg.packet.decodedLength = 0; }
+                p.decodedPayload = p.payload ? atob(p.payload) : "";
+                p.decodedLength = p.decodedPayload.length;
+            } catch(e) { p.decodedLength = 0; p.decodedPayload = ""; }
             
-            packets.unshift(msg.packet);
-            if (packets.length > 5000) packets.pop();
+            packets.push(msg.packet);
+            if (packets.length > 5000) packets.shift();
+            
             needsUpdate = true;
         } else if (msg.type === 'geo_update') {
             packets.forEach(p => {
@@ -440,10 +442,21 @@ function startWebSocket() {
     ws.onclose = () => setTimeout(startWebSocket, 2000);
 }
 
-function updateLoop() {
-    if (needsUpdate) {
+// Keyboard Shortcut: Press 'c' to clear packets
+window.addEventListener('keydown', (e) => {
+    if (e.key === 'c' && document.activeElement.tagName !== 'INPUT') {
+        packets = [];
+        selectedIdx = -1;
+        document.getElementById('pane-detail').innerHTML = '<div style="color:var(--muted); font-size:12px;">Select a packet for deep inspection</div>';
+        needsUpdate = true;
+    }
+});
+
+function updateLoop(timestamp) {
+    if (needsUpdate && timestamp - lastRenderTime > RENDER_THROTTLE_MS) {
         displayData({packets});
         needsUpdate = false;
+        lastRenderTime = timestamp;
     }
     requestAnimationFrame(updateLoop);
 }

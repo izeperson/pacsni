@@ -1,4 +1,7 @@
 #include <pcap.h>
+#include "packet_types.h"
+#include "protocol_dissectors.h"
+
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -60,121 +63,10 @@ void* memmem(const void* haystack, size_t haystacklen, const void* needle, size_
     }
     return NULL;
 }
+#define ICMP_DEST_UNREACH 3
 #endif
 
-const char* DEST_IP = "127.0.0.1";
 static const char* shared_secret = nullptr;
-const int MAX_PAYLOAD_SIZE = 256;
-
-#ifdef _WIN32
-#pragma pack(push, 1)
-#endif
-struct 
-#ifndef _WIN32
-__attribute__((__packed__)) 
-#endif
-PacketInfo {
-    uint64_t timestamp;
-    uint8_t  src_ip[16];
-    uint8_t  dst_ip[16];
-    uint16_t src_port;
-    uint16_t dst_port;
-    uint8_t  protocol;
-    uint8_t  has_tcp_ao;
-    uint8_t  tcp_flags;
-    uint8_t  l3_offset;
-    uint8_t  l4_offset;
-    uint32_t tcp_seq;
-    uint32_t tcp_ack;
-    uint8_t  icmp_type;
-    uint8_t  icmp_code;
-    uint32_t delta_time;
-    uint16_t vlan_id;
-    uint8_t  ip_ttl;
-    uint8_t  ip_tos;
-    uint16_t tcp_win;
-    uint16_t ip_id;
-    uint8_t  is_ipv6;
-    uint8_t  is_fragment;
-    uint16_t tcp_mss;
-    uint8_t  tcp_ws;
-    uint8_t  ipv6_ext_count;
-    uint32_t ipv6_flow;
-    uint32_t wire_len;
-    uint32_t tcp_ts_val;
-    uint32_t tcp_ts_ecr;
-    uint8_t  tcp_sack;
-    uint32_t tcp_rtt;
-    uint32_t vxlan_vni;
-    uint32_t entropy_scaled;
-    uint8_t  ntp_stratum;
-    uint8_t  ntp_mode;
-    uint8_t  igmp_type;
-    uint8_t  igmp_group[4];
-    char     lldp_chassis[32];
-    char     lldp_port[32];
-    uint32_t tcp_sack_edges[8];
-    uint8_t  top_byte;
-    uint8_t  top_byte_freq;
-    uint8_t  pad[151];
-    uint16_t payload_len;
-    uint8_t  src_mac[6];
-    uint8_t  dst_mac[6];
-    char     dns_query[64];
-    char     tls_sni[64];
-    char     extra_info[128];
-    char     app_layer_info[128];
-    uint8_t  payload[MAX_PAYLOAD_SIZE];
-    uint8_t  final_pad[8]; // Corrected to fix memory alignment for exactly 1024 bytes
-};
-#ifdef _WIN32
-#pragma pack(pop)
-#endif
-
-static_assert(sizeof(PacketInfo) == 1024, "PacketInfo struct must be exactly 1024 bytes for protocol compatibility.");
-
-struct CaptureContext {
-    SSL* ssl;
-    std::queue<PacketInfo> queue;
-    std::mutex mutex;
-    std::condition_variable cv;
-    const size_t max_queue_size = 5000;
-};
-
-// Helper struct for Ethernet layer info
-struct EthernetInfo {
-    const ether_header* header;
-    int header_len;
-    uint16_t ether_type;
-    uint16_t vlan_id;
-};
-
-struct IpInfo {
-    const void* header;
-    int header_len;
-    uint8_t src_ip[16];
-    uint8_t dst_ip[16];
-    uint8_t protocol;
-    uint8_t ttl;
-    uint8_t tos;
-    uint16_t id;
-    bool is_ipv6;
-    bool is_fragment;
-};
-
-struct TransportInfo {
-    uint16_t src_port;
-    uint16_t dst_port;
-    uint32_t seq;
-    uint32_t ack;
-    uint16_t window;
-    uint8_t flags;
-    uint16_t mss;
-    uint8_t ws;
-    bool has_ao;
-    const u_char* payload_ptr;
-    int payload_len;
-};
 
 #ifdef _WIN32
 struct ip {
@@ -200,8 +92,6 @@ struct PcapIfDeleter { void operator()(pcap_if_t* i) { if (i) pcap_freealldevs(i
 std::atomic<bool> keep_running(true);
 pcap_t* global_pcap_handle = nullptr;
 
-static uint64_t last_packet_ts = 0;
-
 void check_icmp_unreachable(uint8_t t, uint8_t c, char* o, int m) {
 #ifndef _WIN32
     if (t == ICMP_DEST_UNREACH) {
@@ -209,116 +99,6 @@ void check_icmp_unreachable(uint8_t t, uint8_t c, char* o, int m) {
         if (c < 8) snprintf(o, m, "ICMP Unreachable: %s", reasons[c]);
     }
 #endif
-}
-
-void dissect_ntp_core(const u_char* p, int l, PacketInfo& i) {
-    if (l < 48) return;
-    uint8_t mode = p[0] & 0x07;
-    uint8_t stratum = p[1];
-    const char* ms[] = {"Res", "SymA", "SymP", "Cli", "Srv", "Bcast", "Ctrl", "Priv"};
-    snprintf(i.app_layer_info + strlen(i.app_layer_info), 128 - strlen(i.app_layer_info), " [Mode: %s, Stratum: %d]", ms[mode % 8], stratum);
-}
-
-void check_tcp_anomalies(PacketInfo& info, const TransportInfo& t) {
-    if (t.window == 0 && (t.flags & TH_ACK) && !(t.flags & (TH_SYN|TH_FIN|TH_RST))) {
-        snprintf(info.extra_info, 128, "TCP ZeroWindow");
-    } else if (info.payload_len == 1 && t.seq + 1 == info.tcp_seq && !(t.flags & (TH_SYN|TH_FIN|TH_RST))) {
-        snprintf(info.extra_info, 128, "TCP Keep-Alive");
-    }
-}
-
-uint32_t calculate_entropy_scaled(const uint8_t* d, int l) {
-    if (l <= 0) return 0;
-    int f[256] = {0};
-    for (int i = 0; i < l; i++) f[d[i]]++;
-    double e = 0;
-    for (int i = 0; i < 256; i++) {
-        if (f[i] > 0) {
-            double p = (double)f[i] / l;
-            e -= p * std::log2(p);
-        }
-    }
-    return (uint32_t)(e * 1000);
-}
-
-void dissect_dhcp(const u_char* p, int l, char* o, int m) {
-    if (l < 240 || p[236] != 0x63 || p[237] != 0x82 || p[238] != 0x53 || p[239] != 0x63) return;
-    const u_char* opts = p + 240;
-    int i = 0;
-    while (i < l - 240) {
-        uint8_t c = opts[i++];
-        if (c == 255) break;
-        if (c == 0) continue;
-        if (i >= l - 240) break;
-        uint8_t len = opts[i++];
-        if (i + len > l - 240) break;
-        if (c == 53 && len == 1) {
-            uint8_t t = opts[i];
-            const char* ts[] = {"?", "DISCOVER", "OFFER", "REQUEST", "DECLINE", "ACK", "NAK", "RELEASE", "INFORM"};
-            if (t > 0 && t < 9) snprintf(o, m, "DHCP %s", ts[t]);
-            return;
-        }
-        i += len;
-    }
-}
-
-void dissect_lldp(const u_char* p, int l, PacketInfo& i) {
-    int o = 0;
-    while (o + 2 <= l) {
-        uint16_t tlv = ntohs(*(uint16_t*)(p + o));
-        uint16_t type = tlv >> 9;
-        uint16_t len = tlv & 0x01FF;
-        o += 2;
-        if (o + len > l) break;
-        if (type == 1) {
-            int sl = (len - 1 < 31) ? len - 1 : 31;
-            memcpy(i.lldp_chassis, p + o + 1, sl);
-            i.lldp_chassis[sl] = '\0';
-        } else if (type == 2) {
-            int sl = (len - 1 < 31) ? len - 1 : 31;
-            memcpy(i.lldp_port, p + o + 1, sl);
-            i.lldp_port[sl] = '\0';
-        } else if (type == 0) break;
-        o += len;
-    }
-    snprintf(i.app_layer_info, 128, "LLDP %s/%s", i.lldp_chassis, i.lldp_port);
-}
-
-void dissect_igmp(const u_char* p, int l, PacketInfo& i) {
-    if (l < 8) return;
-    i.igmp_type = p[0];
-    memcpy(i.igmp_group, p + 4, 4);
-    const char* ts[] = {"?", "Query", "v1 Report", "v2 Report", "v2 Leave", "v3 Report"};
-    const char* t = (i.igmp_type == 0x11) ? ts[1] : (i.igmp_type == 0x12) ? ts[2] : (i.igmp_type == 0x16) ? ts[3] : (i.igmp_type == 0x17) ? ts[4] : (i.igmp_type == 0x22) ? ts[5] : ts[0];
-    snprintf(i.extra_info, 128, "IGMP %s Group %u.%u.%u.%u", t, i.igmp_group[0], i.igmp_group[1], i.igmp_group[2], i.igmp_group[3]);
-}
-
-void calculate_byte_stats(const uint8_t* d, int l, PacketInfo& i) {
-    if (l <= 0) return;
-    uint32_t counts[256] = {0};
-    uint32_t max_f = 0;
-    for (int j = 0; j < l; j++) {
-        counts[d[j]]++;
-        if (counts[d[j]] > max_f) {
-            max_f = counts[d[j]];
-            i.top_byte = d[j];
-        }
-    }
-    i.top_byte_freq = (uint8_t)((max_f * 100) / l);
-}
-
-void dissect_vxlan(const u_char* p, int l, PacketInfo& i) {
-    if (l < 8) return;
-    i.vxlan_vni = (p[4] << 16) | (p[5] << 8) | p[6];
-    snprintf(i.app_layer_info, 128, "VXLAN VNI: %u", i.vxlan_vni);
-}
-
-void dissect_ntp(const u_char* p, int l, PacketInfo& i) {
-    if (l < 48) return;
-    i.ntp_mode = p[0] & 0x07;
-    i.ntp_stratum = p[1];
-    const char* ms[] = {"Res", "SymA", "SymP", "Cli", "Srv", "Bcast", "Ctrl", "Priv"};
-    snprintf(i.app_layer_info, 128, "NTP %s (Stratum %d)", ms[i.ntp_mode], i.ntp_stratum);
 }
 
 void dissect_app_common(const u_char* p, int l, char* o, int m) {
@@ -373,28 +153,6 @@ void dissect_icmp6_details(uint8_t t, uint8_t c, char* o, int m) {
     snprintf(o, m, "%s", s);
 }
 
-void dissect_http(const u_char* p, int l, char* o, int m) {
-    if (l < 10) return;
-    const char* ms[] = {"GET ", "POST ", "PUT ", "DELETE ", "HEAD ", "OPTIONS "};
-    for (int i = 0; i < 6; i++) {
-        int ml = strlen(ms[i]);
-        if (l > ml && memcmp(p, ms[i], ml) == 0) {
-            int c = 0;
-            while (c < l && c < m - 1 && p[c] != '\r' && p[c] != '\n') {
-                o[c] = p[c];
-                c++;
-            }
-            o[c] = '\0';
-            const char* h = "\r\nHost: ";
-            const u_char* hp = (const u_char*)memmem(p, l, h, strlen(h));
-            if (hp) {
-                snprintf(o + strlen(o), m - strlen(o), " [Host: %.*s]", 32, hp + 8);
-            }
-            return;
-        }
-    }
-}
-
 void dissect_nd(const u_char* p, int l, char* o, int m) {
     if (l < 8) return;
     uint8_t t = p[0];
@@ -420,115 +178,6 @@ void dissect_stp(const u_char* p, int l, char* o, int m) {
 void dissect_gre(const u_char* p, int l, char* o, int m) {
     if (l < 4) return;
     snprintf(o, m, "GRE Tunnel (Inner: 0x%04x)", ntohs(*(uint16_t*)(p + 2)));
-}
-
-void parse_tcp_options_extended(const u_char* p, int o, int h, PacketInfo& i) {
-    if (h <= 20) return;
-    const u_char* opts = p + o + 20;
-    int len = h - 20;
-    for (int k = 0; k < len; ) {
-        uint8_t kind = opts[k];
-        if (kind == 0) break;
-        if (kind == 1) { k++; continue; }
-        if (k + 1 >= len) break;
-        uint8_t l = opts[k+1];
-        if (l < 2 || k + l > len) break;
-        if (kind == 2 && l == 4) i.tcp_mss = ntohs(*(uint16_t*)(opts + k + 2));
-        else if (kind == 3 && l == 3) i.tcp_ws = opts[k+2];
-        else if (kind == 4 && l == 2) i.tcp_sack = 1;
-        else if (kind == 5 && l >= 10) {
-            int blocks = (l - 2) / 8;
-            if (blocks > 4) blocks = 4;
-            memcpy(i.tcp_sack_edges, opts + k + 2, blocks * 8);
-        }
-        else if (kind == 8 && l == 10) {
-            i.tcp_ts_val = ntohl(*(uint32_t*)(opts + k + 2));
-            i.tcp_ts_ecr = ntohl(*(uint32_t*)(opts + k + 6));
-        } else if (kind == 29) i.has_tcp_ao = 1;
-        k += l;
-    }
-}
-
-void signal_handler(int sig) {
-    (void)sig;
-    keep_running = false;
-    if (global_pcap_handle) {
-        pcap_breakloop(global_pcap_handle);
-    }
-}
-
-void dissect_dns(const u_char* payload, int len, char* out, int out_max) {
-    if (len < 12) return;
-    const u_char* data = payload + 12;
-    int pos = 0;
-    int out_pos = 0;
-    
-    while (pos < len - 12 && out_pos < out_max - 1) {
-        int label_len = data[pos];
-        if (label_len == 0) break;
-        if (label_len > 63) break;
-        
-        pos++;
-        for (int i = 0; i < label_len && pos < len - 12 && out_pos < out_max - 1; i++) {
-            out[out_pos++] = (char)data[pos++];
-        }
-        if (out_pos < out_max - 1) out[out_pos++] = '.';
-    }
-    if (out_pos > 0) {
-        out[out_pos - (out[out_pos-1] == '.' ? 1 : 0)] = '\0';
-    } else {
-        out[0] = '\0';
-    }
-}
-
-void dissect_tls_sni(const u_char* payload, int len, char* out, int out_max) {
-    if (len < 5) return;
-    if (payload[0] != 0x16) return;
-    
-    int handshake_type_pos = 5;
-    if (len < handshake_type_pos + 4 || payload[handshake_type_pos] != 0x01) return;
-    
-    int pos = handshake_type_pos + 38;
-    if (pos >= len) return;
-    
-    int sid_len = payload[pos];
-    pos += 1 + sid_len;
-    
-    if (pos + 2 >= len) return;
-    uint16_t cs_len = ntohs(*(uint16_t*)(payload + pos));
-    pos += 2 + cs_len;
-    
-    if (pos + 1 >= len) return;
-    int comp_len = payload[pos];
-    pos += 1 + comp_len;
-    
-    if (pos + 2 >= len) return;
-    int ext_total_len = ntohs(*(uint16_t*)(payload + pos));
-    pos += 2;
-    int ext_end = pos + ext_total_len;
-    
-    while (pos + 4 <= len && pos < ext_end) {
-        uint16_t ext_type = ntohs(*(uint16_t*)(payload + pos));
-        uint16_t ext_len = ntohs(*(uint16_t*)(payload + pos + 2));
-        pos += 4;
-        
-        if (ext_type == 0x00) {
-            if (pos + 5 <= len) {
-                int list_len = ntohs(*(uint16_t*)(payload + pos));
-                if (pos + 5 + list_len > len) return;
-                if (payload[pos+2] == 0x00) {
-                    int name_len = ntohs(*(uint16_t*)(payload + pos + 3));
-                    if (pos + 5 + name_len <= len) {
-                        int actual_copy = (name_len < out_max - 1) ? name_len : out_max - 1;
-                        memcpy(out, payload + pos + 5, actual_copy);
-                        out[actual_copy] = '\0';
-                        return;
-                    }
-                }
-            }
-        }
-        pos += ext_len;
-    }
 }
 
 void log_ssl_error(const std::string& msg) {
@@ -558,89 +207,12 @@ void parse_tcp_options(const u_char* packet, int offset, int tcp_hlen, Transport
     }
 }
 
-std::optional<EthernetInfo> parse_ethernet_layer(const u_char* packet, uint32_t caplen) {
-    if (caplen < sizeof(ether_header)) return std::nullopt;
-    const ether_header* eth = reinterpret_cast<const ether_header*>(packet);
-    uint16_t etype = ntohs(eth->ether_type);
-    int hlen = sizeof(ether_header);
-    uint16_t v_id = 0;
-    while ((etype == 0x8100 || etype == 0x88a8) && caplen >= (uint32_t)(hlen + 4)) {
-        v_id = ntohs(*(uint16_t*)(packet + hlen)) & 0x0FFF;
-        etype = ntohs(*(uint16_t*)(packet + hlen + 2));
-        hlen += 4;
-    }
-    return EthernetInfo{eth, hlen, etype, v_id};
-}
-
-std::optional<IpInfo> parse_ip_layer(const u_char* packet, uint32_t caplen, int eth_hlen) {
-    if (caplen < (uint32_t)(eth_hlen + 1)) return std::nullopt;
-    uint8_t version = (packet[eth_hlen] >> 4) & 0x0f;
-    IpInfo info;
-    std::memset(&info, 0, sizeof(info));
-    if (version == 4) {
-        if (caplen < (uint32_t)(eth_hlen + 20)) return std::nullopt;
-        const ip* ip_hdr = reinterpret_cast<const ip*>(packet + eth_hlen);
-        info.header_len = ip_hdr->ip_hl * 4;
-        if (info.header_len < 20 || caplen < (uint32_t)(eth_hlen + info.header_len)) return std::nullopt;
-        std::memcpy(info.src_ip + 12, &ip_hdr->ip_src.s_addr, 4);
-        std::memcpy(info.dst_ip + 12, &ip_hdr->ip_dst.s_addr, 4);
-        info.protocol = ip_hdr->ip_p;
-        info.ttl = ip_hdr->ip_ttl;
-        info.tos = ip_hdr->ip_tos;
-        info.id = ntohs(ip_hdr->ip_id);
-        info.is_ipv6 = false;
-        info.is_fragment = (ntohs(ip_hdr->ip_off) & (IP_MF | IP_OFFMASK)) != 0;
-        info.header = ip_hdr;
-    } 
-#ifndef _WIN32
-    else if (version == 6) {
-        if (caplen < (uint32_t)(eth_hlen + sizeof(ip6_hdr))) return std::nullopt;
-        const ip6_hdr* ip6 = reinterpret_cast<const ip6_hdr*>(packet + eth_hlen);
-        info.header_len = 40;
-        std::memcpy(info.src_ip, &ip6->ip6_src, 16);
-        std::memcpy(info.dst_ip, &ip6->ip6_dst, 16);
-        info.protocol = ip6->ip6_nxt;
-        info.ttl = ip6->ip6_hlim;
-        info.tos = (ntohl(ip6->ip6_flow) >> 20) & 0xFF;
-        info.is_ipv6 = true;
-        info.header = ip6;
-    } 
-#endif
-    else return std::nullopt;
-    return info;
-}
-
-std::optional<TransportInfo> parse_transport_layer(const u_char* packet, uint32_t caplen, int eth_hlen, const IpInfo& ip_i) {
-    TransportInfo t;
-    std::memset(&t, 0, sizeof(t));
-    int offset = eth_hlen + ip_i.header_len;
-    // simplified protocol check for cross platform
-    if (ip_i.protocol == 6) { // TCP
-        if (caplen < (uint32_t)(offset + 20)) return std::nullopt;
-        // Using offsets instead of tcphdr struct to avoid header conflicts
-        int hlen = ((packet[offset + 12] >> 4) & 0x0f) * 4;
-        if (hlen < 20 || caplen < (uint32_t)(offset + hlen)) return std::nullopt;
-        t.src_port = ntohs(*(uint16_t*)(packet + offset));
-        t.dst_port = ntohs(*(uint16_t*)(packet + offset + 2));
-        t.seq = ntohl(*(uint32_t*)(packet + offset + 4));
-        t.ack = ntohl(*(uint32_t*)(packet + offset + 8));
-        t.window = ntohs(*(uint16_t*)(packet + offset + 14));
-        t.flags = packet[offset + 13];
-        parse_tcp_options(packet, offset, hlen, t);
-        t.payload_ptr = packet + offset + hlen;
-        t.payload_len = ntohs(((const ip*)ip_i.header)->ip_len) - ip_i.header_len - hlen;
-    } else if (ip_i.protocol == 17) { // UDP
-        if (caplen < (uint32_t)(offset + 8)) return std::nullopt;
-        t.src_port = ntohs(*(uint16_t*)(packet + offset));
-        t.dst_port = ntohs(*(uint16_t*)(packet + offset + 2));
-        t.payload_ptr = packet + offset + 8;
-        t.payload_len = ntohs(*(uint16_t*)(packet + offset + 4)) - 8;
-    } else {
-        t.payload_ptr = packet + offset;
-        t.payload_len = ntohs(((const ip*)ip_i.header)->ip_len) - ip_i.header_len;
-    }
-    return t;
-}
+// Forward declarations to ensure visibility across the translation unit
+void send_packet_info(SSL* ssl, const PacketInfo& info);
+void dissect_ntp_core(const u_char* p, int l, PacketInfo& i);
+void dissect_raw_packet(const RawPacket& raw, PacketInfo& info);
+void worker_thread_main(CaptureContext* ctx);
+void packet_handler(u_char* user_data, const struct pcap_pkthdr* pkthdr, const u_char* packet);
 
 void send_packet_info(SSL* ssl, const PacketInfo& info) {
     if (!ssl) return;
@@ -649,10 +221,12 @@ void send_packet_info(SSL* ssl, const PacketInfo& info) {
     HMAC(EVP_sha512(), shared_secret, (shared_secret ? (int)strlen(shared_secret) : 0),
          reinterpret_cast<const unsigned char*>(&info), sizeof(PacketInfo),
          hmac_result, &hash_len);
+
     uint8_t combined[sizeof(PacketInfo) + 64];
     memset(combined, 0, sizeof(combined));
     memcpy(combined, &info, sizeof(PacketInfo));
     memcpy(combined + sizeof(PacketInfo), hmac_result, hash_len);
+
     size_t total_size = sizeof(combined);
     const char* buffer = reinterpret_cast<const char*>(combined);
     ssize_t sent = 0;
@@ -661,7 +235,7 @@ void send_packet_info(SSL* ssl, const PacketInfo& info) {
         if (n <= 0) {
             int ssl_err = SSL_get_error(ssl, n);
             if (ssl_err == SSL_ERROR_WANT_WRITE || ssl_err == SSL_ERROR_WANT_READ) {
-                std::this_thread::yield(); // Prevent pinning the CPU
+                std::this_thread::yield(); 
                 continue;
             }
             return;
@@ -670,35 +244,39 @@ void send_packet_info(SSL* ssl, const PacketInfo& info) {
     }
 }
 
+void signal_handler(int sig) {
+    (void)sig;
+    keep_running = false;
+    if (global_pcap_handle) {
+        pcap_breakloop(global_pcap_handle);
+    }
+}
+
 void sender_thread_main(CaptureContext* ctx) {
-    while (keep_running || !ctx->queue.empty()) {
+    while (keep_running) {
         PacketInfo info;
-        {
-            std::unique_lock<std::mutex> lock(ctx->mutex);
-            ctx->cv.wait(lock, [ctx] { return !ctx->queue.empty() || !keep_running; });
-            if (ctx->queue.empty()) {
-                if (!keep_running) break;
-                continue;
-            }
-            info = ctx->queue.front();
-            ctx->queue.pop();
+        if (ctx->dissected_queue.pop(info)) {
+            send_packet_info(ctx->ssl, info);
+        } else {
+            std::this_thread::sleep_for(std::chrono::microseconds(10));
         }
+    }
+    PacketInfo info;
+    while (ctx->dissected_queue.pop(info)) {
         send_packet_info(ctx->ssl, info);
     }
 }
 
-void packet_handler(u_char* user_data, const struct pcap_pkthdr* pkthdr, const u_char* packet) {
-    if (!user_data || !pkthdr || !packet) return;
-    CaptureContext* ctx = reinterpret_cast<CaptureContext*>(user_data);
+void dissect_raw_packet(const RawPacket& raw, PacketInfo& info) {
+    const u_char* packet = raw.data;
+    const struct pcap_pkthdr* pkthdr = &raw.pkthdr;
     auto eth_info_opt = parse_ethernet_layer(packet, pkthdr->caplen);
     if (!eth_info_opt) return;
     EthernetInfo eth_info = *eth_info_opt;
-    PacketInfo info;
     memset(&info, 0, sizeof(info));
     uint64_t current_ts = pkthdr->ts.tv_sec * 1000000LL + pkthdr->ts.tv_usec;
     info.timestamp = current_ts;
-    if (last_packet_ts > 0) info.delta_time = (uint32_t)(current_ts - last_packet_ts);
-    last_packet_ts = current_ts;
+    info.delta_time = raw.delta_time;
     memcpy(info.src_mac, eth_info.header->ether_shost, 6);
     memcpy(info.dst_mac, eth_info.header->ether_dhost, 6);
     info.l3_offset = (uint8_t)eth_info.header_len;
@@ -806,13 +384,62 @@ void packet_handler(u_char* user_data, const struct pcap_pkthdr* pkthdr, const u
     info.entropy_scaled = calculate_entropy_scaled(packet, capture_len);
     calculate_byte_stats(packet, capture_len, info);
     memcpy(info.payload, packet, capture_len);
+}
 
-    {
-        std::lock_guard<std::mutex> lock(ctx->mutex);
-        if (ctx->queue.size() < ctx->max_queue_size) {
-            ctx->queue.push(info);
-            ctx->cv.notify_one();
+void packet_handler(u_char* user_data, const struct pcap_pkthdr* pkthdr, const u_char* packet) {
+    CaptureContext* ctx = reinterpret_cast<CaptureContext*>(user_data);
+    if (!ctx) return;
+
+    RawPacket raw;
+    raw.pkthdr = *pkthdr;
+    uint32_t caplen = (pkthdr->caplen < MAX_PAYLOAD_SIZE) ? pkthdr->caplen : MAX_PAYLOAD_SIZE;
+    std::memcpy(raw.data, packet, caplen);
+
+    static struct timeval last_ts = {0, 0};
+    raw.delta_time = (last_ts.tv_sec == 0) ? 0 : 
+        (uint32_t)((pkthdr->ts.tv_sec - last_ts.tv_sec) * 1000000 + (pkthdr->ts.tv_usec - last_ts.tv_usec));
+    last_ts = pkthdr->ts;
+
+    ctx->raw_queue.push(raw);
+}
+
+void worker_thread_main(CaptureContext* ctx) {
+    while (keep_running) {
+        RawPacket raw;
+        if (ctx->raw_queue.pop(raw)) {
+            PacketInfo info;
+            dissect_raw_packet(raw, info);
+            while (!ctx->dissected_queue.push(info) && keep_running) {
+                std::this_thread::yield();
+            }
+        } else {
+            std::this_thread::yield();
         }
+    }
+    RawPacket raw;
+    while (ctx->raw_queue.pop(raw)) {
+        PacketInfo info;
+        dissect_raw_packet(raw, info);
+        while (!ctx->dissected_queue.push(info)) {
+            std::this_thread::yield();
+        }
+    }
+}
+
+void monitor_pcap_stats(pcap_t* handle) {
+    while (keep_running) {
+        struct pcap_stat ps;
+        if (pcap_stats(handle, &ps) == 0) {
+            static uint32_t last_recv = 0;
+            static uint32_t last_drop = 0;
+            uint32_t diff_recv = ps.ps_recv - last_recv;
+            uint32_t diff_drop = ps.ps_drop - last_drop;
+            if (diff_recv > 0 || diff_drop > 0) {
+                printf("[STATS] Engine Captured: %u | Dropped: %u\n", diff_recv, diff_drop);
+            }
+            last_recv = ps.ps_recv; last_drop = ps.ps_drop;
+        }
+        for (int i = 0; i < 10 && keep_running; ++i) ::sleep(1);
     }
 }
 
@@ -827,6 +454,13 @@ int main(int argc, char* argv[]) {
 
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
+
+#ifndef _WIN32
+    if (geteuid() != 0) {
+        fprintf(stderr, "[ERROR] pacsni capture requires root privileges. Please run with sudo.\n");
+        return 1;
+    }
+#endif
 
     shared_secret = getenv("PACSNI_SHARED_SECRET");
     if (!shared_secret) {
@@ -989,17 +623,26 @@ int main(int argc, char* argv[]) {
 
     CaptureContext ctx;
     std::thread sender_thread;
+    std::vector<std::thread> worker_pool;
+    std::thread stats_thread;
+    const int num_workers = 4;
+
     if (keep_running && handle && ssl) {
         ctx.ssl = ssl.get();
         sender_thread = std::thread(sender_thread_main, &ctx);
+        stats_thread = std::thread(monitor_pcap_stats, handle.get());
+        for (int i = 0; i < num_workers; ++i) worker_pool.push_back(std::thread(worker_thread_main, &ctx));
+
         if (pcap_loop(handle.get(), -1, packet_handler, reinterpret_cast<u_char*>(&ctx)) < 0) {
             fprintf(stderr, "pcap_loop error: %s\n", pcap_geterr(handle.get()));
         }
     }
 
     keep_running = false;
-    ctx.cv.notify_all();
+
+    for (auto& t : worker_pool) { if (t.joinable()) t.join(); }
     if (sender_thread.joinable()) sender_thread.join();
+    if (stats_thread.joinable()) stats_thread.join();
 
     if (sockfd != -1) close(sockfd);
     printf("[INFO] Shutting down gracefully.\n");

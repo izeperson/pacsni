@@ -799,5 +799,29 @@ func main() {
 
 	http.HandleFunc("/ws", serveWs)
 	fmt.Printf("Dashboard started! Access the browser dash at: http://localhost:8080\r\n")
-	http.ListenAndServe(":8080", nil)
+
+	// Start server in background
+	go http.ListenAndServe(":8080", nil)
+
+	// Check for a --desktop flag to launch native window
+	if len(os.Args) > 1 && os.Args[1] == "--desktop" {
+		launchNativeWindow()
+	} else {
+		// Keep main thread alive for CLI mode
+		select {}
+	}
+}
+
+// This is a mock-up of how you would integrate a webview library.
+// You would need to add: go get github.com/webview/webview_go
+func launchNativeWindow() {
+	/*
+		w := webview.New(true)
+		defer w.Destroy()
+		w.SetTitle("pacsni | Network Terminal")
+		w.SetSize(1280, 800, webview.HintNone)
+		w.Navigate("http://localhost:8080")
+		w.Run()
+	*/
+	fmt.Println("[DESKTOP] Launching native window...")
 }

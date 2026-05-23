@@ -11,10 +11,10 @@ ifeq ($(OS),Windows_NT)
         OPENSSL_DIR ?= C:\Program Files\OpenSSL-Win64
         CXXFLAGS := /EHsc /W3 /O2 /I"$(NPCAP_SDK)\Include" /I"$(OPENSSL_DIR)\include"
         LDFLAGS := /link /LIBPATH:"$(NPCAP_SDK)\Lib\x64" /LIBPATH:"$(OPENSSL_DIR)\lib" wpcap.lib Packet.lib libssl.lib libcrypto.lib ws2_32.lib
-        BUILD_CPP_CMD = $(CXX) $(CXXFLAGS) cpp/packet_capture.cpp /Fe:cpp/bin/packet_capture$(EXE_EXT) $(LDFLAGS)
+        BUILD_CPP_CMD = $(CXX) $(CXXFLAGS) cpp/packet_capture.cpp cpp/protocol_dissectors.cpp /Fe:cpp/bin/packet_capture$(EXE_EXT) $(LDFLAGS)
     else
         CXX := g++
-        BUILD_CPP_CMD = $(CXX) -std=c++17 -Wall -Wextra cpp/packet_capture.cpp -o cpp/bin/packet_capture$(EXE_EXT) -lwpcap -lssl -lcrypto -lws2_32
+        BUILD_CPP_CMD = $(CXX) -std=c++17 -Wall -Wextra cpp/packet_capture.cpp cpp/protocol_dissectors.cpp -o cpp/bin/packet_capture$(EXE_EXT) -lwpcap -lssl -lcrypto -lws2_32
     endif
     MKDIR := powershell -Command New-Item -ItemType Directory -Force
     RM := powershell -Command Remove-Item -Recurse -Force
@@ -22,7 +22,7 @@ ifeq ($(OS),Windows_NT)
 else
     # Linux / macOS Configuration
     EXE_EXT :=
-    BUILD_CPP_CMD = g++ -std=c++17 -Wall -Wextra cpp/packet_capture.cpp -o cpp/bin/packet_capture -lpcap -lssl -lcrypto
+    BUILD_CPP_CMD = g++ -std=c++17 -Wall -Wextra cpp/packet_capture.cpp cpp/protocol_dissectors.cpp -o cpp/bin/packet_capture -lpcap -lssl -lcrypto
     MKDIR := mkdir -p
     RM := rm -rf
     CP := cp
