@@ -10,9 +10,9 @@ function Build-Cpp {
         $openSslDir = "C:\Program Files\OpenSSL-Win64"
         $cxxFlags = "/EHsc /W3 /O2 /I`"$npcapSdk\Include`" /I`"$openSslDir\include`""
         $ldFlags = "/link /LIBPATH:`"$npcapSdk\Lib\x64`" /LIBPATH:`"$openSslDir\lib`" wpcap.lib Packet.lib libssl.lib libcrypto.lib ws2_32.lib"
-        Invoke-Expression "cl $cxxFlags cpp/packet_capture.cpp /Fe:`"$cppBinDir\packet_capture.exe`" $ldFlags"
+        Invoke-Expression "cl $cxxFlags cpp/packet_capture.cpp cpp/protocol_dissectors.cpp /Fe:`"$cppBinDir/packet_capture.exe`" $ldFlags"
     } else {
-        g++ -std=c++17 -Wall -Wextra cpp/packet_capture.cpp -o "$cppBinDir\packet_capture.exe" -lwpcap -lssl -lcrypto -lws2_32
+        g++ -std=c++17 -Wall -Wextra cpp/packet_capture.cpp cpp/protocol_dissectors.cpp -o "$cppBinDir/packet_capture.exe" -lwpcap -lssl -lcrypto -lws2_32
     }
 }
 
